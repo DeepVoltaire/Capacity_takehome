@@ -73,7 +73,10 @@ class LoadTifDataset(torch.utils.data.Dataset):
         if sample["image"].shape[-1] < 50:
             sample["image"] = sample["image"].transpose((2, 0, 1))
 
-        sample["image"] = (sample["image"] / 2**15).astype(np.float32)
+        if "L2A" in self.img_paths_before[idx]:
+            sample["image"] = (sample["image"] / 2**15).astype(np.float32)
+        elif "_sentinel1_" in self.img_paths_before[idx]:
+            sample["image"] = (sample["image"] / 2**11).astype(np.float32) #2048
 
         sample["img_path_before"] = self.img_paths_before[idx]
         # assert sample["image"].shape[0] == 3, f"Image shape is {sample['image']}, expected 3 bands."

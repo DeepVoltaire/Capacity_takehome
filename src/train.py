@@ -55,7 +55,7 @@ def train(hps, train_loader, val_loader):
 
     # Initialize model, loss, optimizer and lr schedule
     # model = build_model(hps)
-    model = SiameseUNetShared(in_ch=15, base_ch=32, fusion_mode="concat_diff", out_ch=2)
+    model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
 
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
@@ -135,7 +135,7 @@ def train(hps, train_loader, val_loader):
             optimizer.zero_grad()
             if hps.use_fp16:
                 with torch.cuda.amp.autocast():
-                    preds = model(x_data[:, :15], x_data[:, 15:])
+                    preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                     loss = loss_func(preds, targets)
 
                 # Scales loss. Calls backward() on scaled loss to create scaled gradients.
@@ -145,7 +145,7 @@ def train(hps, train_loader, val_loader):
                 # Updates the scale for next iteration.
                 scaler.update()
             else:
-                preds = model(x_data[:, :15], x_data[:, 15:])
+                preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                 loss = loss_func(preds, targets)
                 loss.backward()
                 optimizer.step()
@@ -194,11 +194,11 @@ def train(hps, train_loader, val_loader):
             if hps.use_fp16:
                 with torch.cuda.amp.autocast():
                     # preds = model(x_data)
-                    preds = model(x_data[:, :15], x_data[:, 15:])
+                    preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                     loss = loss_func(preds, targets)
             else:
                 # preds = model(x_data)
-                preds = model(x_data[:, :15], x_data[:, 15:])
+                preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                 loss = loss_func(preds, targets)
             losses.update(loss.detach().item(), x_data.size(0))
 
@@ -436,9 +436,9 @@ class XEDiceLoss(nn.Module):
             y_dat = (targets == j + 1).float() if pred.dtype == torch.float32 else (targets == j + 1).half()
             dice_loss += 1 - (2.0 * torch.sum(pred * y_dat)) / (torch.sum(pred + y_dat) + EPS)
             # if self.debug:
-            print(f"Dice for class {j+1}: {1 - (2. * torch.sum(pred * y_dat)) / (torch.sum(pred + y_dat) + EPS):.3f}")
-        print(f"XE: {xe_loss:.3f}")
+        #     print(f"Dice for class {j+1}: {1 - (2. * torch.sum(pred * y_dat)) / (torch.sum(pred + y_dat) + EPS):.3f}")
         dice_loss /= self.num_classes
+        # print(f"XE: {xe_loss:.3f}, Dice: {dice_loss:.3f}")
 
         return self.alpha * xe_loss + (1 - self.alpha) * dice_loss
 
