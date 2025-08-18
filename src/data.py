@@ -6,6 +6,8 @@ import tifffile
 import cv2
 import matplotlib.pyplot as plt
 
+from src.visualize import visualize_s2_concat_bands_path
+
 
 class LoadTifDataset(torch.utils.data.Dataset):
     def __init__(
@@ -60,8 +62,11 @@ class LoadTifDataset(torch.utils.data.Dataset):
 
         # Load in and preprocess label mask
         if not self.test:
-            arr_y = tifffile.imread(self.mask_paths[idx]).squeeze()
-            arr_y = (arr_y == 255).astype(np.int32)
+            if self.mask_paths[idx] == "empty":
+                arr_y = np.zeros((400, 400), dtype=np.int32)
+            else:
+                arr_y = tifffile.imread(self.mask_paths[idx]).squeeze()
+                arr_y = (arr_y == 255).astype(np.int32)
             arr_y[nan_mask_x] = 255  # set nan pixels to 255
             sample["mask"] = arr_y
 
@@ -94,35 +99,41 @@ class LoadTifDataset(torch.utils.data.Dataset):
             show_specific_index (int, optional): If passed, only show the image corresponding to this index. Defaults to None.
         """
         for _ in range(how_many):
-            rand_int = np.random.randint(len(self.img_paths))
+            rand_int = np.random.randint(len(self.img_paths_before))
             if show_specific_index is not None:
                 rand_int = show_specific_index
             sample = self.__getitem__(rand_int)
-            print(self.img_paths[rand_int], rand_int)
+            print(self.img_paths_before[rand_int], rand_int)
+            print(self.img_paths_after[rand_int])
             print(self.mask_paths[rand_int])
-            f, axarr = plt.subplots(1, 3, figsize=(30, 12))
+            f, axarr = plt.subplots(1, 4, figsize=(30, 12))
 
-            img_string = "S2"
-            arr_x = tifffile.imread([self.img_paths[rand_int].replace("B02.tif", f"B0{k}.tif") for k in [2, 3, 4]])
-            if arr_x.shape[0] < 20:
-                arr_x = arr_x.transpose((1, 2, 0))
-            axarr[0].imshow(scale_S2_img(arr_x))
-
-            img = sample["image"] * 2**16
-            axarr[0].set_title(f"{img_string} Image")  # . Min: {img.min():.4f}, Max: {img.max():.4f}")
-            # axarr[1].imshow(arr_x[:, :, 0])
-            # axarr[1].set_title(f"Min: {arr_x[:, :, 0].min():.0f}, Max: {arr_x[:, :, 0].max():.0f}", fontsize=15)
-            axarr[1].imshow(img[0])
-            axarr[1].set_title(
-                f"Mean: {img[0].mean():.0f}, Min: {img[0].min():.0f}, Max: {img[0].max():.0f}", fontsize=15
-            )
+            if "L2A" in self.img_paths_before[rand_int]:
+                img_string = "S2"
+                # arr_x_before = tifffile.imread(self.img_paths_before[idx])
+                # if arr_x.shape[0] < 20:
+                #     arr_x = arr_x.transpose((1, 2, 0))
+                axarr[0].imshow(visualize_s2_concat_bands_path(self.img_paths_before[rand_int]))
+                axarr[0].set_title(f"{img_string} Before Image")
+                axarr[1].imshow(visualize_s2_concat_bands_path(self.img_paths_after[rand_int]))
+                axarr[1].set_title(f"{img_string} After Image")
+                img = sample["image"] * 2**15
+                # axarr[1].imshow(arr_x[:, :, 0])
+                # axarr[1].set_title(f"Min: {arr_x[:, :, 0].min():.0f}, Max: {arr_x[:, :, 0].max():.0f}", fontsize=15)
+                axarr[2].imshow(img[-7])
+                axarr[2].set_title(
+                    f"Mean: {img[-7].mean():.0f}, Min: {img[-7].min():.0f}, Max: {img[-7].max():.0f}", fontsize=15
+                )
+            # else:
+            #     img_before = visualize_s1_path(img_paths_before[rand_int])
+            #     img_after = visualize_s1_path(img_paths_after[rand_int])
 
             if "mask" in sample.keys():
-                axarr[2].imshow(img[0])
+                axarr[3].imshow(img[-7])
                 mask = sample["mask"]
                 print(f"Mask unique values: {np.unique(mask)}")
-                axarr[2].set_title(f"Mask==1 px: {(mask == 1).sum()}", fontsize=15)
-                axarr[2].imshow(np.ma.masked_where(mask == 0, mask), cmap="spring", alpha=0.4)
+                axarr[3].set_title(f"Mask==1 px: {(mask == 1).sum()}", fontsize=15)
+                axarr[3].imshow(np.ma.masked_where(mask == 0, mask), cmap="autumn", alpha=0.8)
             plt.tight_layout()
             plt.show()
 

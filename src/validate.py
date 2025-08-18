@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.model import SiameseUNetShared
+from src.models import SiameseUNetSMPShared
 from src.train import build_model, tp_fp_fn_with_ignore
 from src.data import get_dataloaders
-from src.visualize import visualize_s2_concat_bands_path
+from src.visualize import visualize_s2_concat_bands_path, visualize_s1_path
 
 
 def predict_and_save(
@@ -60,7 +61,17 @@ def find_and_load_models(hps_list, fold_list=[0, 1, 2], trained_models_dir=None)
     models = []
     for fold_nb in fold_list:
         for hps in hps_list:
-            model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
+            # model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
+            model = SiameseUNetSMPShared(
+                in_channels=hps.input_channel,
+                classes=2,
+                encoder_name="timm_efficientnet_b1",  # underscore or hyphen accepted
+                encoder_weights="imagenet",
+                encoder_depth=5,
+                decoder_channels=(256, 128, 64, 32, 16),
+                time_fusion_mode="concat_diff",
+            )
+
             # model = build_model(hps)
             model = model.cuda()
             model.eval()
@@ -423,11 +434,15 @@ def visualize_single_model(
         print(f"{i}")  # - {location:20} - B2 > 7000: {high_b2/1000:.1f}k")
         f, ax = plt.subplots(2, 3, figsize=(35, 20))
 
-        img_before = visualize_s2_concat_bands_path(img_paths_before[i])
-        img_after = visualize_s2_concat_bands_path(img_paths_after[i])
+        if "L2A" in img_paths_before[i]:
+            img_before = visualize_s2_concat_bands_path(img_paths_before[i])
+            img_after = visualize_s2_concat_bands_path(img_paths_after[i])
+        else:
+            img_before = visualize_s1_path(img_paths_before[i])
+            img_after = visualize_s1_path(img_paths_after[i])
 
         ax[0,0].imshow(img_after)
-        after_date = img_paths_after[i].split("/")[-1].split('.')[0].split('_')[-1]
+        after_date = img_paths_after[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
         after_date_str = f"{after_date[:4]}-{after_date[4:6]}-{after_date[6:8]}"
         ax[0,0].set_title(f"After: {after_date_str}", fontsize=fontsize)
         # pred = ((preds[i].astype(np.float32) / 255.0) > threshold) * 1
@@ -444,41 +459,17 @@ def visualize_single_model(
         ax[0,2].imshow(np.ma.masked_where(label != 1, label), cmap="autumn", alpha=alpha)
         ax[0,2].set_title(f"image with GT mask", fontsize=fontsize)
 
-        before_date = img_paths_before[i].split("/")[-1].split('.')[0].split('_')[-1]
+        before_date = img_paths_before[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
         before_date_str = f"{before_date[:4]}-{before_date[4:6]}-{before_date[6:8]}"
         ax[1,0].set_title(f"Before: {before_date_str}", fontsize=fontsize)
         ax[1,0].imshow(img_before)
         ax[1,1].imshow(img_after)
         ax[1,1].set_title(f"After: {after_date_str}", fontsize=fontsize)
 
-        # ax[3].imshow(img_first_ax)
-        # ax[3].imshow(
-        #     scale_S2_img(arr_x[:, :, 0:1], min_values=np.array([100]), max_values=np.array([3500]))[:, :, 0]
-        # )
-        # ax[3].set_title(f"Blue", fontsize=15)
-        # ax[3].imshow(np.ma.masked_where(pred_std_02 != 1, pred_std_02), cmap="autumn", alpha=alpha)
-        # ax[3].set_title(f"Std > 0.2: {100 * pred_std_02_sum/512**2:.1f}%", fontsize=15)
-        # plt.tight_layout()
-        # plt.show()
-
-        # f, ax = plt.subplots(1, 2, figsize=(35, 12))
-        # ax[0].imshow(img_first_ax)
-        # ax[0].set_title(f"Image", fontsize=fontsize)
-
-        # ax[2].imshow(img_first_ax)
-        # blue_clouds = ((arr_x[:, :, 0] > 2300) * 1).copy()
-        # ax[2].imshow(np.ma.masked_where(pred_std_02 != 1, pred_std_02), cmap="autumn", alpha=alpha)
-        # ax[2].set_title(f"B2 > 2300", fontsize=15)
-        # plt.tight_layout()
-        # plt.show()
-
         # f, ax = plt.subplots(1, 2, figsize=(35, 15))
         # ax[0].imshow(img_first_ax)
         fps_ = ((pred == 1) & (label == 0)) * 1
         fns_ = ((pred == 0) & (label == 1)) * 1
-        # ax[1].imshow(np.ma.masked_where(fps_ != 1, fps_), cmap="autumn", alpha=1)
-        # ax[1].imshow(np.ma.masked_where(fns_ != 1, fns_), cmap="gray", alpha=1)
-        # ax[1].set_title(f"FPs = RED ({fps_.sum()}), FNs = BLACK ({fns_.sum()})", fontsize=fontsize)
         ax[1,2].imshow(np.ma.masked_where(fps_ != 1, fps_), cmap="autumn", alpha=1)
         ax[1,2].imshow(np.ma.masked_where(fns_ != 1, fns_), cmap="gray", alpha=1)
         ax[1,2].set_title(f"FPs = RED ({fps_.sum()}), FNs = BLACK ({fns_.sum()})", fontsize=fontsize)
@@ -489,50 +480,6 @@ def visualize_single_model(
             break
     return looked_at, looked_at_idx
 
-
-# fcc_to_bands = {
-#     "SWIR": ["B12", "B8", "B4"],
-#     "SWIRP": ["B8", "B11", "B4"],
-#     "RGB": ["B4", "B3", "B2"],
-#     "CIR": ["B8", "B4", "B3"],
-# }
-# fcc_to_band_indices = {
-#     "SWIR": [12, 7, 3],
-#     "SWIRP": [7, 11, 3],
-#     "RGB": [3, 2, 1],
-#     "CIR": [7, 3, 2],
-# }
-# min_max = {
-#     "SWIR": {"min": [100, 100, 100], "max": [3500] * 3},
-#     "SWIRP": {"min": [100, 100, 100], "max": [3500] * 3},
-#     "RGB": {"min": [100, 100, 100], "max": [2500] * 3},
-#     "CIR": {"min": [100, 100, 100], "max": [3500] * 3},
-# }
-
-# def scale_S2_img(matrix, min_values, max_values):
-#     w, h, d = matrix.shape
-#     if min_values is None:
-#         min_values = np.array([100, 100, 100])
-#         max_values = np.array([3500, 3500, 3500])
-
-#     flat = np.reshape(matrix, (w * h, d)).astype(np.float64)
-#     flat = (flat - min_values[None, :]) / (max_values[None, :] - min_values[None, :])
-#     out = np.reshape(flat, (w, h, d))
-#     return out.clip(0, 1)
-
-# def visualize_s2_path(path_b2, profile = "SWIR", downsample = 0):
-#     img = tifffile.imread([path_b2.replace("B2", band) for band in fcc_to_bands[profile]])
-#     if img.shape[0] < 15:
-#         img = np.transpose(img, (1, 2, 0))
-#     if downsample > 0:
-#         img = img[::downsample, ::downsample]
-#     return scale_S2_img(img, np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
-
-# def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR", downsample = 0):
-#     img = tifffile.imread(concat_bands_path)
-#     if downsample > 0:
-#         img = img[::downsample, ::downsample]
-#     return scale_S2_img(img[:, :, fcc_to_band_indices[profile]], np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
 
 def predict_and_save_multiple_separate_models(hps, models):
     """

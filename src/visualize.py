@@ -78,15 +78,33 @@ def scale_img(matrix, min_values, max_values):
     out = np.reshape(flat, (w, h, d))
     return out.clip(0, 1)
 
-# def visualize_s2_path(path_b2, profile = "SWIR", downsample = 0):
-#     img = tifffile.imread([path_b2.replace("B2", band) for band in fcc_to_bands[profile]])
-#     if img.shape[0] < 15:
-#         img = np.transpose(img, (1, 2, 0))
-#     if downsample > 0:
-#         img = img[::downsample, ::downsample]
-#     return scale_img(img, np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
-
 def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
+    # img = tifffile.imread(concat_bands_path)
+    img = rasterio.open(concat_bands_path).read()
+    if img.shape[0] < 25:
+        img = np.transpose(img, (1, 2, 0))
+
+
+    if "L2A" in concat_bands_path:
+        fcc_to_band_indices = fcc_to_band_indices_l2a
+    else:
+        fcc_to_band_indices = fcc_to_band_indices_16d
+    img = img[:, :, fcc_to_band_indices[profile]]
+    img = img.astype(np.float32)
+    # img = img - 1000
+    # img[img < 0] = 0
+
+    _img = img.copy()  # make a copy where we fill nodata with nan for percentile computation
+    _img[_img == 0] = np.nan
+    mins = np.nanpercentile(_img, 2, axis=(0,1))
+    maxs = np.nanpercentile(_img, 98, axis=(0,1))
+    print(f"S2: {mins=}, {maxs=}")
+    maxs = maxs.clip(3000, None)
+    print(f"S2 clipped: {mins=}, {maxs=}")
+
+    return scale_img(img, mins, maxs)
+
+def visualize_s2_concat_bands_path_old(concat_bands_path, profile = "SWIR"):
     # img = tifffile.imread(concat_bands_path)
     img = rasterio.open(concat_bands_path).read()
     if img.shape[0] < 25:
@@ -94,9 +112,17 @@ def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
     if "L2A" in concat_bands_path:
         fcc_to_band_indices = fcc_to_band_indices_l2a
         min_max = min_max_l2a
-        img = img.astype(np.float32)
-        img = img - 1000
-        img[img < 0] = 0
+        # img = img.astype(np.float32)
+        # img = img - 1000
+        # img[img < 0] = 0
+        # img[img == 0] = np.nan
+
+        mins = np.array(min_max[profile]["min"])
+        maxs = np.array(min_max[profile]["max"])
+        # print(np.nanmean(img[:, :, fcc_to_band_indices[profile]]))
+        # if np.nanmean(img[:, :, fcc_to_band_indices[profile]]) > 2500:
+        #     maxs = maxs + 1000
+        return scale_img(img[:, :, fcc_to_band_indices[profile]], mins, maxs)
     else:
         fcc_to_band_indices = fcc_to_band_indices_16d
         min_max = min_max_16d
@@ -109,7 +135,6 @@ def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
         print(f"16D: {mins=}, {maxs=}")
         return scale_img(img[:, :, fcc_to_band_indices[profile]], np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
         # return scale_img(img[:, :, fcc_to_band_indices[profile]], mins, maxs)
-    return scale_img(img[:, :, fcc_to_band_indices[profile]], np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
 
 def visualize_ls_concat_bands_path(concat_bands_path, profile = "SWIR", downsample = 0):
     # img = tifffile.imread(concat_bands_path).astype(np.float32)

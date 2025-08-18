@@ -12,6 +12,7 @@ import torch.nn as nn
 # from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
 # import segmentation_models_pytorch as smp
 from src.model import SiameseUNetShared
+from src.models import SiameseUNetSMPShared
 
 torch.backends.cudnn.benchmark = True
 import datetime
@@ -55,7 +56,17 @@ def train(hps, train_loader, val_loader):
 
     # Initialize model, loss, optimizer and lr schedule
     # model = build_model(hps)
-    model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
+    # model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
+    model = SiameseUNetSMPShared(
+        in_channels=hps.input_channel,
+        classes=2,
+        encoder_name="timm_efficientnet_b1",  # underscore or hyphen accepted
+        encoder_weights="imagenet",
+        encoder_depth=5,
+        decoder_channels=(256, 128, 64, 32, 16),
+        time_fusion_mode="concat_diff",
+        # time_fusion_mode="diff",
+    )
 
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
