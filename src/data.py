@@ -235,7 +235,7 @@ def get_dataloaders(hps):
             f"{int(len(img_paths_before_train) / hps.train_batch_size)} batches long. Doubling dataset size"
         )
         img_paths_before_train = img_paths_before_train * 2
-        img_paths_before_train = img_paths_before_train * 2
+        img_paths_after_train = img_paths_after_train * 2
         mask_paths_train = mask_paths_train * 2
         weights_all = weights_all * 2
 
