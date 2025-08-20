@@ -26,8 +26,6 @@ class HyperParams(object):
     ## Data Augmentation on CPU
     train_crop_size = attr.ib(default=256, type=int)
     randomsizecrop_interpolation = attr.ib(default=cv2.INTER_LINEAR)
-    da_p_cutout = attr.ib(default=0.0, type=float, converter=float)
-    cutmix_alpha = attr.ib(default=0.0, type=float, converter=float)
     random_sized_params = attr.ib(default=[0.0, 0.0])
     da_brightness_magnitude = attr.ib(default=0.0, type=float, converter=float)
     da_contrast_magnitude = attr.ib(default=0.0, type=float, converter=float)
@@ -42,17 +40,9 @@ class HyperParams(object):
     ## Model
     num_classes = attr.ib(default=1, type=int)
     input_channel = attr.ib(default=2, type=int)
-    smp_decoder_use_batchnorm = attr.ib(default=True, type=bool)
-    smp_decoder_channels_mult = attr.ib(default=1.0, type=float, converter=float)
-    smp_decoder_use_attention = attr.ib(default=False, type=bool)
     backbone = attr.ib(default="timm_efficientnet_b1", type=str)
-    pretrained = attr.ib(default=True, type=bool)
-    model = attr.ib(
-        default="unet",
-        validator=in_(
-            ["unet", "unetplusplus"],
-        ),
-    )
+    model = attr.ib(default="unet", validator=in_(["unet", "unetplusplus"]))
+    pretrained = attr.ib(default="noisy-student", type=str)
 
     ## Training Setup
     resume = attr.ib(default="", type=str)
@@ -71,12 +61,6 @@ class HyperParams(object):
     gpu_da_params = attr.ib(default=[0.25])
 
     ### Loss, Metric
-    loss = attr.ib(
-        default="xedice",
-        validator=in_(
-            ["xedice", "lovasz", "focal"],
-        ),
-    )
     alpha = attr.ib(default=0.5, type=float, converter=float)
 
     def __str__(self):

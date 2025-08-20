@@ -6,7 +6,7 @@ import tifffile
 import cv2
 import matplotlib.pyplot as plt
 
-from src.visualize import visualize_s2_concat_bands_path
+from src.visualize import visualize_s2_concat_bands_path, visualize_s2_concat_bands_path_new
 
 
 class LoadTifDataset(torch.utils.data.Dataset):
@@ -54,6 +54,52 @@ class LoadTifDataset(torch.utils.data.Dataset):
         if arr_x_after.shape[0] != 400 or arr_x_after.shape[1] != 400:
             arr_x_after = cv2.resize(arr_x_after, (400, 400), interpolation=cv2.INTER_NEAREST)
 
+        # Drop AOT, WVP bands, 16d does not have them
+        if "L2A" in self.img_paths_before[idx]:
+            idxs_to_use = list(range(1, arr_x_before.shape[2] - 1))
+            arr_x_before = arr_x_before[:, :, idxs_to_use]
+        if "L2A" in self.img_paths_after[idx]:
+            idxs_to_use = list(range(1, arr_x_after.shape[2] - 1))
+            arr_x_after = arr_x_after[:, :, idxs_to_use]
+
+        scl_before = arr_x_before[:, :, -1]
+        if scl_before.max() > 11:
+            if scl_before.max() > 50:
+                factor = 6
+            elif scl_before.max() > 45:
+                factor = 5
+            elif scl_before.max() >= 40:
+                factor = 4.5
+            else:
+                factor = 4
+        else:
+            factor = 1
+
+        arr_x_before = (arr_x_before / factor).round(0).astype(np.float32)
+        # low values, but all minimum above 1000 ==> Subtract by 1000
+        if (np.nanmin(arr_x_before[:, :, [10, 7, 3]], axis=(0,1)) > 1000).sum() == 3:
+            arr_x_before = arr_x_before - 1000
+            arr_x_before[arr_x_before < 0] = 0
+
+        scl_after = arr_x_after[:, :, -1]
+        if scl_after.max() > 11:
+            if scl_after.max() > 50:
+                factor = 6
+            elif scl_after.max() > 45:
+                factor = 5
+            elif scl_after.max() >= 40:
+                factor = 4.5
+            else:
+                factor = 4
+        else:
+            factor = 1
+
+        arr_x_after = (arr_x_after / factor).round(0).astype(np.float32)
+        # low values, but all minimum above 1000 ==> Subtract by 1000
+        if (np.nanmin(arr_x_after[:, :, [10, 7, 3]], axis=(0,1)) > 1000).sum() == 3:
+            arr_x_after = arr_x_after - 1000
+            arr_x_after[arr_x_after < 0] = 0
+
         arr_x = np.concatenate([arr_x_before, arr_x_after], axis=-1)
 
         arr_x = np.nan_to_num(arr_x)
@@ -78,8 +124,10 @@ class LoadTifDataset(torch.utils.data.Dataset):
         if sample["image"].shape[-1] < 50:
             sample["image"] = sample["image"].transpose((2, 0, 1))
 
-        if "L2A" in self.img_paths_before[idx]:
+        if "_sentinel2_" in self.img_paths_before[idx]:
             sample["image"] = (sample["image"] / 2**15).astype(np.float32)
+            if sample["image"].max() > 1: 
+                print(f"Warning: Sentinel-2 image max value exceeds 1, Idx:{idx}")
         elif "_sentinel1_" in self.img_paths_before[idx]:
             sample["image"] = (sample["image"] / 2**11).astype(np.float32) #2048
 
@@ -108,14 +156,14 @@ class LoadTifDataset(torch.utils.data.Dataset):
             print(self.mask_paths[rand_int])
             f, axarr = plt.subplots(1, 4, figsize=(30, 12))
 
-            if "L2A" in self.img_paths_before[rand_int]:
+            if "_sentinel2_" in self.img_paths_before[rand_int]:
                 img_string = "S2"
                 # arr_x_before = tifffile.imread(self.img_paths_before[idx])
                 # if arr_x.shape[0] < 20:
                 #     arr_x = arr_x.transpose((1, 2, 0))
-                axarr[0].imshow(visualize_s2_concat_bands_path(self.img_paths_before[rand_int]))
+                axarr[0].imshow(visualize_s2_concat_bands_path_new(self.img_paths_before[rand_int]))
                 axarr[0].set_title(f"{img_string} Before Image")
-                axarr[1].imshow(visualize_s2_concat_bands_path(self.img_paths_after[rand_int]))
+                axarr[1].imshow(visualize_s2_concat_bands_path_new(self.img_paths_after[rand_int]))
                 axarr[1].set_title(f"{img_string} After Image")
                 img = sample["image"] * 2**15
                 # axarr[1].imshow(arr_x[:, :, 0])
@@ -128,12 +176,12 @@ class LoadTifDataset(torch.utils.data.Dataset):
             #     img_before = visualize_s1_path(img_paths_before[rand_int])
             #     img_after = visualize_s1_path(img_paths_after[rand_int])
 
-            if "mask" in sample.keys():
-                axarr[3].imshow(img[-7])
-                mask = sample["mask"]
-                print(f"Mask unique values: {np.unique(mask)}")
-                axarr[3].set_title(f"Mask==1 px: {(mask == 1).sum()}", fontsize=15)
-                axarr[3].imshow(np.ma.masked_where(mask == 0, mask), cmap="autumn", alpha=0.8)
+                if "mask" in sample.keys():
+                    axarr[3].imshow(img[-7])
+                    mask = sample["mask"]
+                    print(f"Mask unique values: {np.unique(mask)}")
+                    axarr[3].set_title(f"Mask==1 px: {(mask == 1).sum()}", fontsize=15)
+                    axarr[3].imshow(np.ma.masked_where(mask == 0, mask), cmap="autumn", alpha=0.8)
             plt.tight_layout()
             plt.show()
 
@@ -307,15 +355,6 @@ def get_train_transforms(hps):
         )  # cv2.INTER_NEAREST faster than cv2.INTER_LINEAR faster than cv2.INTER_CUBIC
     else:
         train_transforms.append(albumentations.RandomCrop(hps.train_crop_size, hps.train_crop_size))
-    if hps.da_p_cutout:
-        train_transforms.append(
-            albumentations.Cutout(
-                num_holes=8,
-                max_h_size=int(hps.train_crop_size * 0.1875),
-                max_w_size=int(hps.train_crop_size * 0.1875),
-                p=hps.da_p_cutout,
-            )
-        )
     return train_transforms
 
 

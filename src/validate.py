@@ -1,38 +1,27 @@
 import glob
 import torch
 import pandas as pd
-
 from tqdm import tqdm
 import os
 import tifffile
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.model import SiameseUNetShared
-from src.models import SiameseUNetSMPShared
-from src.train import build_model, tp_fp_fn_with_ignore
+from src.model import SiameseUNetSMPShared
+from src.train import tp_fp_fn_with_ignore
 from src.data import get_dataloaders
-from src.visualize import visualize_s2_concat_bands_path, visualize_s1_path
+from src.visualize import visualize_s2_concat_bands_path, visualize_s1_path, visualize_s2_concat_bands_path_new
 
 
-def predict_and_save(
-    models,
-    val_loader,
-    on_gpu=True,
-    output_spatial_size=(512, 512),
-    save_path=None,
-):
+def predict_and_save(models, val_loader):
     """
-    Predict and save as uint8 (0-255) to 'save_path' given a val_loader and a list of loaded models and hps
+    Predicts given a val_loader and a list of loaded models and hps
     """
     probs = []
     torch.set_grad_enabled(False)
     for iter_num, data in tqdm(enumerate(val_loader), total=len(val_loader)):
-        x_data = data["image"]
-        if on_gpu:
-            x_data = x_data.cuda(non_blocking=True)
-
-        with torch.cuda.amp.autocast():
+        x_data = data["image"].cuda(non_blocking=True)
+        with torch.amp.autocast(device_type="cuda"):
             preds = torch.softmax(models[0](x_data), dim=1)[:, 1:]
             for model_nb in range(1, len(models)):
                 preds += torch.softmax(models[model_nb](x_data), dim=1)[:, 1:]
@@ -40,12 +29,7 @@ def predict_and_save(
         preds /= len(models)
         if preds.size(1) == 1:
             preds = preds[:, 0]
-
-        if preds.size(-1) != output_spatial_size[-1]:
-            raise ValueError(
-                f"You want to save predictions of size ({preds.size(-2)}, {preds.size(-1)}) into size {output_spatial_size}. Specify the correct size."
-            )
-        probs.append(preds.cpu().numpy())  # * 255).astype(np.uint8))
+        probs.append(preds.cpu().numpy())
     # Concatenate predictions with potentially unequal batch size for the last batch
     probs_last = probs[-1]
     probs = np.array(probs[:-1])
@@ -54,32 +38,28 @@ def predict_and_save(
     return probs
 
 
-def find_and_load_models(hps_list, fold_list=[0, 1, 2], trained_models_dir=None):
+def find_and_load_models(hps_list, fold_list=[0, 1, 2]):
     """Given a list of hps and folds, returns a list of build models with their best weights loaded."""
-    if trained_models_dir is None:
-        trained_models_dir = "trained_models"
     models = []
     for fold_nb in fold_list:
         for hps in hps_list:
-            # model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
             model = SiameseUNetSMPShared(
                 in_channels=hps.input_channel,
-                classes=2,
-                encoder_name="timm_efficientnet_b1",  # underscore or hyphen accepted
-                encoder_weights="imagenet",
+                classes=hps.num_classes + 1,
+                encoder_name=hps.backbone,
+                encoder_weights=hps.pretrained,
                 encoder_depth=5,
                 decoder_channels=(256, 128, 64, 32, 16),
                 time_fusion_mode="concat_diff",
             )
 
-            # model = build_model(hps)
             model = model.cuda()
             model.eval()
 
-            model_weights_paths = glob.glob(f"{trained_models_dir}/{hps.name}/fold_{fold_nb}/*/*pt")
+            model_weights_paths = glob.glob(f"trained_models/{hps.name}/fold_{fold_nb}/*/*pt")
             if len(model_weights_paths) > 1:
                 raise ValueError(f"Multiple weight paths: {model_weights_paths}")
-            cp = torch.load(model_weights_paths[0])
+            cp = torch.load(model_weights_paths[0], weights_only=True)
             model.load_state_dict(cp["model_state_dict"])
             print(f"Loaded {model_weights_paths[0]} at epoch {cp['epoch_num']}")
             if torch.cuda.device_count() > 1:  # Multi GPU
@@ -91,17 +71,15 @@ def find_and_load_models(hps_list, fold_list=[0, 1, 2], trained_models_dir=None)
 def return_metrics_all_folds(
     hps_list,
     threshold=0.5,
-    on_gpu=True,
     output_spatial_size=(512, 512),
     also_save_preds=False,
-    save_path=None,
     fold_nbs=[0,1,2,3,4],
     preloaded_models=None,
 ):
     """
     Return tps, fps and fns per image per class given a threshold per class and a list of hps.
     """
-    if also_save_preds:  # Initialize bcolz array for saving preds as uint8
+    if also_save_preds:
         probs = []
 
     losses, tps, fps, fns = [], [], [], []
@@ -122,25 +100,17 @@ def return_metrics_all_folds(
 
         torch.set_grad_enabled(False)
         for iter_num, data in enumerate(val_loader):
-            x_data = data["image"]
-            targets = data["mask"]
-            if on_gpu:
-                x_data = x_data.cuda(non_blocking=True)
-                targets = targets.cuda(non_blocking=True)
+            x_data = data["image"].cuda(non_blocking=True)
+            targets = data["mask"].cuda(non_blocking=True)
 
             # predict
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 preds = torch.softmax(models[0](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
                 for model_nb in range(1, len(models)):
                     preds += torch.softmax(models[model_nb](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
             preds /= len(models)
 
             if also_save_preds:  # save preds as uint8
-                if preds.size(-1) != output_spatial_size[-1]:
-                    raise ValueError(
-                        f"You want to save predictions of size ({preds.size(-2)}, {preds.size(-1)}) "
-                        f"into size {output_spatial_size}. Specify the correct size."
-                    )
                 probs.append(preds.cpu().numpy())
 
             # gather metrics
@@ -156,185 +126,6 @@ def return_metrics_all_folds(
     if also_save_preds:
         probs = np.concatenate(probs, axis=0)
     return probs, losses, tps, fps, fns
-
-
-def return_metrics(
-    models,
-    hps_list,
-    val_loader,
-    thresholds=[0.5],
-    on_gpu=True,
-    output_spatial_size=(512, 512),
-    also_save_preds=False,
-    save_path=None,
-):
-    """
-    Return tps, fps and fns per image per class for each of the thresholds given a val_loader and a list of loaded models and hps.
-    """
-    hps = hps_list[0]
-    num_classes = hps_list[0].num_classes
-    if also_save_preds:
-        if save_path is None:
-            raise ValueError("Please provide a 'save_path' if you want to save predictions to disk")
-        if num_classes == 1:
-            save_shape = (0, output_spatial_size[0], output_spatial_size[1])
-        else:
-            save_shape = (0, num_classes, output_spatial_size[0], output_spatial_size[1])
-        probs = bcolz.carray(np.zeros(save_shape, "uint8"), mode="w", rootdir=save_path)
-
-    losses = []
-    tps = {t: [] for t in thresholds}
-    fps = {t: [] for t in thresholds}
-    fns = {t: [] for t in thresholds}
-
-    torch.set_grad_enabled(False)
-    for iter_num, data in enumerate(val_loader):
-        x_data = data["image"]
-        targets = data["mask"]
-        if on_gpu:
-            x_data = x_data.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-
-        with torch.cuda.amp.autocast():
-            preds = torch.softmax(models[0](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1:]
-            for model_nb in range(1, len(models)):
-                preds += torch.softmax(models[model_nb](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1:]
-        preds /= len(models)
-
-        for threshold in thresholds:
-            pred = (preds[:, 0] > threshold) * 1
-            for k in range(len(targets)):
-                tp, fp, fn = tp_fp_fn_with_ignore(pred[k], targets[k])
-                assert tp >= 0 and fp >= 0 and fn >= 0, f"Negative tp/fp/fn: tp: {tp}, fp: {fp}, fn: {fn}"
-                tps[threshold].append(tp.item())
-                fps[threshold].append(fp.item())
-                fns[threshold].append(fn.item())
-
-        if also_save_preds:
-            if num_classes == 1:
-                preds = preds[:, 0]
-            if preds.size(-1) != output_spatial_size[0]:
-                raise ValueError(
-                    f"You want to save predictions of size ({preds.size(-2)}, {preds.size(-1)}) into size {output_spatial_size}. Specify the correct size."
-                )
-            probs.append((preds.cpu().numpy() * 255).astype(np.uint8))
-            if iter_num % 10 == 9:
-                probs.flush()
-    if also_save_preds:
-        probs.flush()
-    if len(thresholds) == 1:
-        tps, fps, fns = tps[thresholds[0]], fps[thresholds[0]], fns[thresholds[0]]
-    return losses, tps, fps, fns
-
-
-def cross_validation(
-    hps_list,
-    thresholds=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-    debug=False,
-    preloaded_models=None,
-):
-    """
-    Finds the best thresholds per class by calculating IoUs given a list of thresholds and a list of hps over all
-    validation folds. If the list of hps has length more than one, an ensemble of multiple models is cross validated.
-    """
-    df = pd.read_pickle(hps_list[0].df_path)
-    # df = df.iloc[:500]
-    df = df[df["fold"].notnull()]
-
-    hps_names = [hps.name for hps in hps_list]
-    # Get tps, fps, fns on all water and all water subgroups for all folds
-    for fold_nb in range(int(df.loc[df["fold"] != "train", "fold"].max()) + 1):
-        if preloaded_models:
-            models = preloaded_models
-        else:
-            models = find_and_load_models(hps_list, fold_list=[fold_nb])
-
-        hps = hps_list[0]
-        hps.only_val = True
-        hps.fold_nb = fold_nb
-        _, val_loader = get_dataloaders(hps=hps)
-
-        _, tps, fps, fns = return_metrics(models, hps_list, val_loader, thresholds=thresholds)
-        for t in thresholds:
-            df.loc[df["fold"] == fold_nb, f"tp@{t:.2f}"] = tps[t]
-            df.loc[df["fold"] == fold_nb, f"fp@{t:.2f}"] = fps[t]
-            df.loc[df["fold"] == fold_nb, f"fn@{t:.2f}"] = fns[t]
-
-    # Calculate IoUs on all water and for all subgroups for all thresholds --> Find the best threshold
-    final_metric, best_threshold, best_comb_score, best_stats = {}, {}, {}, {}
-    miou, final_metric, best_threshold, best_comb_score = {}, -100, 0.5, -100
-    best_stats = {}
-    for t in thresholds:
-        tp_str, fp_str = f"tp@{t:.2f}", f"fp@{t:.2f}"
-        fn_str = f"fn@{t:.2f}"
-        stats = df[[tp_str, fp_str, fn_str]].sum()
-        stats["IoU"] = stats[tp_str] / (stats[tp_str] + stats[fp_str] + stats[fn_str])
-        miou = stats["IoU"].mean()
-
-        if debug:
-            print("#" * 100)
-            print(f"Performance @ t = {t:.2f} ({hps_names})")
-            print("=" * 100)
-            stats["recall"] = stats[tp_str] / (stats[tp_str] + stats[fn_str])
-            stats["precision"] = stats[tp_str] / (stats[tp_str] + stats[fp_str])
-            print(stats[["recall", "precision", "IoU"]])
-
-        final_metric = miou
-        if final_metric > best_comb_score:
-            best_threshold, best_comb_score = t, final_metric
-        else:
-            if not debug:
-                break
-
-    # Given the best threshold, now we can print out the crossvalidation results for all water and flood water
-    t = best_threshold
-    tp_str, fp_str = f"tp@{t:.2f}", f"fp@{t:.2f}"
-    fn_str = f"fn@{t:.2f}"
-    stats = df[[tp_str, fp_str, fn_str]].sum()
-    stats["IoU"] = stats[tp_str] / (stats[tp_str] + stats[fp_str] + stats[fn_str])
-    best_stats = stats.copy()
-    miou = stats["IoU"].mean()
-
-    print("#" * 100)
-    print(f"Performance @ t = {t:.2f} ({hps_names})")
-    print("=" * 100)
-    stats["recall"] = stats[tp_str] / (stats[tp_str] + stats[fn_str])
-    stats["precision"] = stats[tp_str] / (stats[tp_str] + stats[fp_str])
-    print(stats[["recall", "precision", "IoU"]])
-    print("=" * 100)
-    print(f"Best IoU of @{t:.2f}: {best_comb_score:.4f}")
-
-    return df, best_stats, best_threshold
-
-
-def calc_ious(group, calc_more_columns=False):
-    """Given a dataframe group object, calculate and return IoUs and optionally Precision and Recall"""
-    result = {}
-    result["img_count"] = group.shape[0]
-    cols1, cols2 = [], []
-    tps = group["tps"].sum() + 1e-12
-    fps = group["fps"].sum() + 1e-12
-    fns = group["fns"].sum() + 1e-12
-    precision = tps / (tps + fps)
-    recall = tps / (tps + fns)
-    if sum([tps, fps, fns]) < 500:
-        # print(tps, fps, fns)
-        result[f"IoU"] = np.nan
-    else:
-        result[f"IoU"] = tps / (tps + fps + fns)
-    if calc_more_columns:
-        result[f"Precision"] = precision
-        result[f"Recall"] = recall
-        result[f"TPS"] = tps / 1e6
-        result[f"FPS"] = fps / 1e6
-        result[f"FNS"] = fns / 1e6
-    cols1.append(f"IoU")
-
-    if not calc_more_columns:
-        return pd.Series(result, index=["img_count"] + cols1)
-    else:
-        cols2.extend([f"Precision", f"Recall", "TPS", "FPS", "FNS"])
-        return pd.Series(result, index=["img_count"] + cols1 + cols2)
 
 
 def visualize_single_model(
@@ -370,147 +161,79 @@ def visualize_single_model(
         idxs_to_use = np.argsort([(fp + fn) / (tp + 1e-6) for fp, fn, tp in zip(fps, fns, tps)])[::-1]
     else:
         idxs_to_use = list(range(len(fns)))
-        # np.random.seed(222911)
         np.random.shuffle(idxs_to_use)
-    #     idxs_to_use = [
-    #         781,3268,1471,1717,4632,3643,2098,4114,3017,2388,2292,1281,4932,452,3011,2330,3673,6639,4109,733,446,1924,
-    # 4932,1933,6211,2000,2307,4113,3840,2082,1209,3542,2866,3713,4167,2769,4274,2298,2487,5392,1584,
-    #     ]
 
     tp_sum, fp_sum, fn_sum = sum(tps) + 1, sum(fps) + 1, sum(fns) + 1
-    looked_at, looked_at_idx = [], []
     count = 0
-    # locations = sorted(df["location"].unique().tolist())
-    location_count = 0
     for idx_, i in enumerate(idxs_to_use):
-        # print(i)
-        # if not "47.0625,15.4226" in img_paths[i]:
-        #     continue
-        # if fps[i] < 400:
-        #     continue
-        # if fps[i] >= 700:
-        #     continue
-        # if "_improved" in GT_paths[i]:
-        #     continue
-
-
-        # pred = np.array([(preds[i].astype(np.float32) / 255.0) for preds in preds_list])
-        pred = np.array([preds[i] for preds in preds_list])
-        # pred = (preds[i] > threshold).astype(np.uint8)
-
-        # pred_std = np.std(pred, axis=0)
-        # pred_std_02 = (pred_std > 0.15).astype(np.uint8)
-        # pred_std_02_sum = pred_std_02.sum()
-
-        pred = (pred.mean(axis=0) > threshold) * 1
-        # pred_sum = pred.sum()
-        # std_to_pred_ratio = pred_std_02_sum / (pred_sum+1)
-        # if std_to_pred_ratio < .5:
-        #     continue
-        # if pred_std_02_sum + pred_sum <= 2000:
-        #     continue
-        # print(f"{pred_std_02_sum=}")
-        # print(f"{pred_sum=}")
-        # print(f"{std_to_pred_ratio=:.2f}")
         count += 1
         if count <= skip_how_many:
             continue
+        pred = np.array([preds[i] for preds in preds_list])
+        pred = (pred.mean(axis=0) > threshold) * 1
 
         fold, clouds_nodata_best_before, clouds_nodata_best_after = df.loc[df["path_best_before"] == img_paths_before[i], [
             "fold", "clouds_nodata_best_before", "clouds_nodata_best_after"]].iloc[0]
 
-        looked_at.append(img_paths_before[i])
-        looked_at_idx.append(i)
         print(f"{img_paths_before[i]}, Fold {fold}")
-        print(f"{img_paths_after[i]}, Fold {fold}")
+        print(f"{img_paths_after[i]}")
         print(f"{GT_paths[i]}")
-        # print(f"FP/FN ratio      : {fps[i]/(fns[i]+1):.1f}")
         print(f"FN/FP ratio      : {fns[i]/(fps[i]+1):.1f}")
         print(f"FP/TP ratio      : {fps[i]/(tps[i]+1):.1f}")
         print(f"FN/TP ratio      : {fns[i]/(tps[i]+1):.1f}")
         print(f"FP+FN / TP ratio : {(fps[i] + fns[i])/(tps[i]+1):.1f}")
-        # print(f"Max(FP,FN) / Min(FP,FN) ratio : {max_ratio:.1f}")
         print("#" * 100)
-        print(f"{i}")  # - {location:20} - B2 > 7000: {high_b2/1000:.1f}k")
-        f, ax = plt.subplots(2, 3, figsize=(35, 20))
+        print(f"{i}")
 
-        if "L2A" in img_paths_before[i]:
-            img_before = visualize_s2_concat_bands_path(img_paths_before[i])
-            img_after = visualize_s2_concat_bands_path(img_paths_after[i])
+        if "_sentinel2_" in img_paths_before[i]:
+            img_before = visualize_s2_concat_bands_path_new(img_paths_before[i])
+            img_after = visualize_s2_concat_bands_path_new(img_paths_after[i])
         else:
             img_before = visualize_s1_path(img_paths_before[i])
             img_after = visualize_s1_path(img_paths_after[i])
 
-        ax[0,0].imshow(img_after)
-        after_date = img_paths_after[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
-        after_date_str = f"{after_date[:4]}-{after_date[4:6]}-{after_date[6:8]}"
-        ax[0,0].set_title(f"After: {after_date_str}", fontsize=fontsize)
-        # pred = ((preds[i].astype(np.float32) / 255.0) > threshold) * 1
-        ax[0,1].imshow(img_after)
-        ax[0,1].imshow(np.ma.masked_where(pred == 0, pred), cmap="autumn", alpha=alpha)
-        title_string = f"FPs: {fps[i]:.0f} = {100 * fps[i] / fp_sum:.1f}%, FNs: {fns[i]:.0f} = {100 * fns[i] / fn_sum:.1f}%, TPs: {tps[i]:.0f}"
-        ax[0,1].set_title(f"(Pred) {title_string}", fontsize=fontsize)
-
-        label = tifffile.imread(GT_paths[i])
-        # nan_mask = label == 255
-        label = (label == 255).astype(np.uint8)
-        # label[nan_mask] = 0
-        ax[0,2].imshow(img_after)
-        ax[0,2].imshow(np.ma.masked_where(label != 1, label), cmap="autumn", alpha=alpha)
-        ax[0,2].set_title(f"image with GT mask", fontsize=fontsize)
-
+        f, ax = plt.subplots(1, 4, figsize=(35, 10))
         before_date = img_paths_before[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
         before_date_str = f"{before_date[:4]}-{before_date[4:6]}-{before_date[6:8]}"
-        ax[1,0].set_title(f"Before: {before_date_str}", fontsize=fontsize)
-        ax[1,0].imshow(img_before)
-        ax[1,1].imshow(img_after)
-        ax[1,1].set_title(f"After: {after_date_str}", fontsize=fontsize)
+        ax[0].set_title(f"Before: {before_date_str}", fontsize=fontsize)
+        ax[0].imshow(img_before)
 
-        # f, ax = plt.subplots(1, 2, figsize=(35, 15))
-        # ax[0].imshow(img_first_ax)
-        fps_ = ((pred == 1) & (label == 0)) * 1
-        fns_ = ((pred == 0) & (label == 1)) * 1
-        ax[1,2].imshow(np.ma.masked_where(fps_ != 1, fps_), cmap="autumn", alpha=1)
-        ax[1,2].imshow(np.ma.masked_where(fns_ != 1, fns_), cmap="gray", alpha=1)
-        ax[1,2].set_title(f"FPs = RED ({fps_.sum()}), FNs = BLACK ({fns_.sum()})", fontsize=fontsize)
+        ax[1].imshow(img_after)
+        after_date = img_paths_after[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        after_date_str = f"{after_date[:4]}-{after_date[4:6]}-{after_date[6:8]}"
+        ax[1].set_title(f"After: {after_date_str}", fontsize=fontsize)
+
+        ax[2].imshow(img_after)
+        ax[2].imshow(np.ma.masked_where(pred == 0, pred), cmap="autumn", alpha=alpha)
+        title_string = f"FPs: {fps[i]:.0f} = {100 * fps[i] / fp_sum:.1f}%, FNs: {fns[i]:.0f} = {100 * fns[i] / fn_sum:.1f}%, TPs: {tps[i]:.0f}"
+        ax[2].set_title(f"(Pred) {title_string}", fontsize=fontsize)
+
+        if GT_paths[i] == "empty":
+            label = np.zeros((400, 400), dtype=np.uint8)
+            deforest_date = ""
+        else:
+            label = tifffile.imread(GT_paths[i])
+            deforest_date = GT_paths[i].split("/")[-1].split("_")[1]
+            deforest_date = f"{deforest_date[:4]}-{deforest_date[4:6]}-{deforest_date[6:8]}"
+        label = (label == 255).astype(np.uint8)
+        ax[3].imshow(img_after)
+        ax[3].imshow(np.ma.masked_where(label != 1, label), cmap="autumn", alpha=alpha)
+        ax[3].set_title(f"Deforestation mask {deforest_date}", fontsize=fontsize)
+
+        # before_date = img_paths_before[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        # before_date_str = f"{before_date[:4]}-{before_date[4:6]}-{before_date[6:8]}"
+        # ax[1,0].set_title(f"Before: {before_date_str}", fontsize=fontsize)
+        # ax[1,0].imshow(img_before)
+        # ax[1,1].imshow(img_after)
+        # ax[1,1].set_title(f"After: {after_date_str}", fontsize=fontsize)
+
+        # fps_ = ((pred == 1) & (label == 0)) * 1
+        # fns_ = ((pred == 0) & (label == 1)) * 1
+        # ax[1,2].imshow(np.ma.masked_where(fps_ != 1, fps_), cmap="autumn", alpha=1)
+        # ax[1,2].imshow(np.ma.masked_where(fns_ != 1, fns_), cmap="gray", alpha=1)
+        # ax[1,2].set_title(f"FPs = RED ({fps_.sum()}), FNs = BLACK ({fns_.sum()})", fontsize=fontsize)
         plt.tight_layout()
         plt.show()
 
         if count >= export_how_many + skip_how_many:
             break
-    return looked_at, looked_at_idx
-
-
-def predict_and_save_multiple_separate_models(hps, models):
-    """
-    Predict and save multiple models to separate save_paths given a val_loader and a list of loaded models.
-    Hyperparameters are assumed to be the same. Predictions are saved as uint8 (0-255).
-    """
-    probs = []
-    for k in range(len(models)):
-        probs.append([])
-
-    torch.set_grad_enabled(False)
-    hps.only_val = True
-    _, val_loader = get_dataloaders(hps=hps)
-    
-    for iter_num, data in tqdm(enumerate(val_loader), total=len(val_loader)):
-        # pass
-        x_data = data["image"].cuda(non_blocking=True)
-        for k in range(len(models)):
-            # preds = torch.sigmoid(models[k](x_data)[:, 0])
-            preds = torch.softmax(models[k](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1:]
-            # probs[k].append((preds.cpu().numpy() * 255).round(0).astype(np.uint8))
-            probs[k].append(preds.cpu().numpy())
-    for k in range(len(models)):
-        probs[k] = np.concatenate(probs[k], axis=0)
-    return probs
-
-
-indices_to_pred = [
-    213, 112, 
-]
-
-indices_to_nan = [
-    102, 94,
-]

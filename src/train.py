@@ -9,16 +9,13 @@ import pytz
 import torch
 import yaml
 import torch.nn as nn
-# from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
-# import segmentation_models_pytorch as smp
-from src.model import SiameseUNetShared
-from src.models import SiameseUNetSMPShared
+from src.model import SiameseUNetSMPShared
 
 torch.backends.cudnn.benchmark = True
 import datetime
 import logging
 
-sys.path.extend(["../", "../.."])
+# sys.path.extend(["../", "../.."])
 
 
 def train(hps, train_loader, val_loader):
@@ -55,13 +52,11 @@ def train(hps, train_loader, val_loader):
     log.setLevel(logging.INFO)
 
     # Initialize model, loss, optimizer and lr schedule
-    # model = build_model(hps)
-    # model = SiameseUNetShared(in_ch=hps.input_channel, base_ch=32, fusion_mode="concat_diff", out_ch=2)
     model = SiameseUNetSMPShared(
         in_channels=hps.input_channel,
-        classes=2,
-        encoder_name="timm_efficientnet_b1",  # underscore or hyphen accepted
-        encoder_weights="imagenet",
+        classes=hps.num_classes + 1,
+        encoder_name=hps.backbone, #"timm_efficientnet_b1",  # underscore or hyphen accepted
+        encoder_weights=hps.pretrained, #"noisy-student", #"imagenet",
         encoder_depth=5,
         decoder_channels=(256, 128, 64, 32, 16),
         time_fusion_mode="concat_diff",
@@ -72,19 +67,7 @@ def train(hps, train_loader, val_loader):
         model = torch.nn.DataParallel(model)
     logging.info(f"Training with {torch.cuda.device_count()} GPUS")
 
-    if hps.loss == "focal":
-        loss_func = FocalLoss(mode="multiclass", ignore_index=255)
-    elif hps.loss == "lovasz":
-        loss_func = XELovaszLoss(ignore_index=255)
-        # loss_func = LovaszLoss(mode="multiclass", ignore_index=255)
-    elif hps.loss == "xedice":
-        loss_func = XEDiceLoss(
-            alpha=hps.alpha,
-            num_classes=hps.num_classes,
-            ignore_index=255,
-        )
-    else:
-        raise ValueError(f"Unknown loss: {hps.loss}")
+    loss_func = XEDiceLoss(alpha=hps.alpha, num_classes=hps.num_classes, ignore_index=255)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=hps.lr * torch.cuda.device_count(), weight_decay=hps.weight_decay
@@ -95,14 +78,12 @@ def train(hps, train_loader, val_loader):
         mode="max",
         factor=0.5,
         patience=hps.patience,
-        # verbose=True,
         threshold=0.0015,
     )
-    if torch.cuda.is_available():
-        model.to(device="cuda")
+    model.to(device="cuda")
 
     if hps.use_fp16:
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler()
         logging.info(f"Training is done with mixed precision")
 
     if len(hps.resume) > 0:
@@ -130,14 +111,9 @@ def train(hps, train_loader, val_loader):
         end = time.time()
         for iter_num, data in enumerate(train_loader):
             data_time.update(time.time() - end)
-            if torch.cuda.is_available():
-                x_data = data["image"].to(device="cuda", non_blocking=True)
-                targets = data["mask"].long().to(device="cuda", non_blocking=True)
-            else:
-                x_data = data["image"]#.to(device="cpu", non_blocking=True)
-                targets = data["mask"].long()#.to(device="cpu", non_blocking=True)
+            x_data = data["image"].to(device="cuda", non_blocking=True)
+            targets = data["mask"].long().to(device="cuda", non_blocking=True)
 
-            # import pdb; pdb.set_trace()
             start = time.time()
             if hps.gpu_da_params[0] != 0:
                 x_data, targets = gpu_da(x_data, targets, hps.gpu_da_params)
@@ -145,7 +121,7 @@ def train(hps, train_loader, val_loader):
 
             optimizer.zero_grad()
             if hps.use_fp16:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type="cuda"):
                     preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                     loss = loss_func(preds, targets)
 
@@ -190,33 +166,21 @@ def train(hps, train_loader, val_loader):
         end = time.time()
         for iter_num, data in enumerate(val_loader):
             data_time.update(time.time() - end)
-            # if iter_num > 1 and data_time.val > 0.5:
-            #     logging.info("Waiting, because Validation DataTime is too high")
-            #     time.sleep(np.random.randint(5, 10))  # to unblock validation dataloader
-            if torch.cuda.is_available():
-                x_data = data["image"].to(device="cuda", non_blocking=True)
-                targets = data["mask"].long().to(device="cuda", non_blocking=True)
-            else:
-                x_data = data["image"]#.to(device="cpu", non_blocking=True)
-                targets = data["mask"].long()#.to(device="cpu", non_blocking=True)
-            # x_data = x_data.to(device="cuda", non_blocking=True)
-            # targets = data["mask"].long().to(device="cuda", non_blocking=True)
+            x_data = data["image"].to(device="cuda", non_blocking=True)
+            targets = data["mask"].long().to(device="cuda", non_blocking=True)
 
             if hps.use_fp16:
-                with torch.cuda.amp.autocast():
-                    # preds = model(x_data)
+                with torch.amp.autocast(device_type="cuda"):
                     preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                     loss = loss_func(preds, targets)
             else:
-                # preds = model(x_data)
                 preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
                 loss = loss_func(preds, targets)
             losses.update(loss.detach().item(), x_data.size(0))
 
             preds = (torch.softmax(preds, dim=1)[:, 1:] > 0.5) * 1
 
-            # for index in range(len(targets)):
-            #     # calculate metrics on all water grps
+            # calculate metrics on all water grps
             metrics.update_metrics(preds, targets)
 
             batch_time.update(time.time() - end)
@@ -243,7 +207,6 @@ def train(hps, train_loader, val_loader):
                     "Combination_metric": best_metric,
                     "epoch_num": curr_epoch_num,
                     "model_state_dict": model.state_dict(),
-                    # "optim_state_dict": optimizer.state_dict(),
                 }
             )
 
@@ -273,68 +236,6 @@ def train(hps, train_loader, val_loader):
 
     logging.info(f"Best validation combination metric of {best_metric:.5f} in epoch {best_metric_epoch}.")
     return best_metric, best_metric_epoch
-
-
-def build_model(hps):
-    """Builds a PyTorch segmentation model.
-    Builds a PyTorch segmentation model according to the type of architecture, encoder backbone,
-    number of input channel and classes specified.
-    Args:
-        hps (Hyperparams): Hyperparameters of the model to be built.
-    Raises:
-        NotImplementedError: The model architecture is not implemented.
-    Returns:
-        nn.Module: PyTorch segmentation model ready for inference
-    """
-
-    num_classes = hps.num_classes + 1
-    backbone = hps.backbone if hps.backbone[:4] != "timm" else hps.backbone.replace("_", "-")
-    encoder_weights = "imagenet" if hps.backbone[:4] != "timm" else "noisy-student"
-
-    if hps.model == "unet":
-        decoder_channels = [int(x * hps.smp_decoder_channels_mult) for x in [256, 128, 64, 32, 16]]
-        decoder_attention_type = None if hps.smp_decoder_use_attention == 0 else "scse"
-        print(
-            hps.model,
-            backbone,
-            encoder_weights,
-            f"BatchNorm: {hps.smp_decoder_use_batchnorm==1}",
-            f"Decoder Channel: {decoder_channels}, Decoder Attention Type: {decoder_attention_type}",
-        )
-        net = smp.Unet(
-            encoder_name=backbone,
-            encoder_depth=5,
-            encoder_weights=encoder_weights,
-            decoder_use_batchnorm=hps.smp_decoder_use_batchnorm,
-            decoder_channels=decoder_channels,
-            decoder_attention_type=decoder_attention_type,
-            in_channels=hps.input_channel,
-            classes=num_classes,
-        )
-    elif hps.model == "unetplusplus":
-        decoder_channels = [int(x * hps.smp_decoder_channels_mult) for x in [256, 128, 64, 32, 16]]
-        decoder_attention_type = None if hps.smp_decoder_use_attention == 0 else "scse"
-        print(
-            hps.model,
-            backbone,
-            encoder_weights,
-            f"BatchNorm: {hps.smp_decoder_use_batchnorm==1}",
-            f"Decoder Channel: {decoder_channels}, Decoder Attention Type: {decoder_attention_type}",
-        )
-        net = smp.UnetPlusPlus(
-            encoder_name=backbone,
-            encoder_depth=5,
-            encoder_weights=encoder_weights,
-            decoder_use_batchnorm=hps.smp_decoder_use_batchnorm,
-            decoder_channels=decoder_channels,
-            decoder_attention_type=decoder_attention_type,
-            in_channels=hps.input_channel,
-            classes=num_classes,
-        )
-    else:
-        raise NotImplementedError(hps.model)
-
-    return net
 
 
 def rotate(input, degrees=90):
@@ -455,32 +356,6 @@ class XEDiceLoss(nn.Module):
 
     def get_name(self):
         return "XEDiceLoss"
-
-
-class XELovaszLoss(nn.Module):
-    """
-    Mixture of alpha * CrossEntropy and (1 - alpha) * LovaszLoss.
-    """
-
-    def __init__(self, alpha=0.5, num_classes=1, debug=False, ignore_index=255):
-        super().__init__()
-        self.xe = nn.CrossEntropyLoss(ignore_index=ignore_index)
-        self.lovasz = LovaszLoss(mode="multiclass", ignore_index=ignore_index)
-        self.alpha = alpha
-        self.num_classes = num_classes
-        self.debug = debug
-        self.ignore_index = ignore_index
-
-    def forward(self, preds, targets):
-        xe_loss = self.xe(preds, targets) if self.alpha != 0 else 0
-        lovasz_loss = self.lovasz(preds, targets)
-        # if self.debug:
-        print(f"Lovasz: {lovasz_loss:.3f}, XE: {xe_loss:.3f}")
-
-        return self.alpha * xe_loss + (1 - self.alpha) * lovasz_loss
-
-    def get_name(self):
-        return "XELovaszLoss"
 
 
 class Metrics:

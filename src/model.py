@@ -1,157 +1,68 @@
 """
-Two architectures for change segmentation:
+Siamese U-Net change segmentation using **Segmentation Models PyTorch (SMP)** with a
+**pretrained timm-efficientnet-b1** encoder.
 
-1) Siamese U-Net (shared weights, single-modality)
-   - One encoder shared across t0 ("before") and t1 ("after").
-   - Per-scale fusion of features via concatenation, (abs)difference, or both.
-   - Standard U-Net decoder predicts the change mask.
+Includes two models:
+  1) `SiameseUNetSMPShared` — single-modality, shared encoder across time (t0/t1),
+     per-scale time fusion, UNet decoder.
+  2) `SiameseUNetSMPDualStream` — dual-stream (Optical + SAR) encoders shared over time,
+     time fusion within each modality then cross-modal fusion, UNet decoder.
 
-Notes
------
-- Designed to be minimal-yet-strong baselines you can extend (deeper encoders, more scales, normalization blocks, etc.).
-- The code is pure PyTorch with clear shapes; no external deps beyond torch.
-- You can plug in pretrained backbones by replacing `UNetEncoder` with timm/segformer encoders, as long as you adapt channel dims.
+Key points:
+- Uses `smp.encoders.get_encoder` with `encoder_name="timm-efficientnet-b1"` (hyphen spelling).
+- Accepts arbitrary input channels (e.g., 4 for S2, 2 for SAR). SMP re-inits the first conv weight
+  when `in_channels != 3`, so ImageNet weights still help.
+- Per-scale fusion choices: "concat", "diff", "absdiff" (default), or "concat_diff".
+- Version-friendly construction of `UnetDecoder` supporting SMP ≥0.5 (use_norm) and older (use_batchnorm).
+
+You can train end-to-end (both encoder & decoder) or freeze the encoder for a few epochs then unfreeze.
 """
+from __future__ import annotations
+from typing import List, Sequence, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ------------------------
-# U-Net building blocks
-# ------------------------
+import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.base import SegmentationHead
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class Down(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.conv = DoubleConv(in_ch, out_ch)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.pool(x))
-
-
-class Up(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, bilinear: bool = True):
-        super().__init__()
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-            self.conv = DoubleConv(in_ch, out_ch)
-        else:
-            self.up = nn.ConvTranspose2d(in_ch // 2, in_ch // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_ch, out_ch)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
-        # Pad if needed (to handle odd sizes)
-        diffY = skip.size(2) - x.size(2)
-        diffX = skip.size(3) - x.size(3)
-        x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
-
-
-class OutConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+try:
+    # SMP ≥ 0.5.x
+    from segmentation_models_pytorch.decoders.unet.decoder import UnetDecoder  # type: ignore
+    _SMP_NEW = True
+except Exception:  # pragma: no cover
+    # legacy path
+    from segmentation_models_pytorch.unet.decoder import UnetDecoder  # type: ignore
+    _SMP_NEW = False
 
 
 # ------------------------
-# Encoders / Decoders
+# Helpers & Fusion blocks
 # ------------------------
 
-class UNetEncoder(nn.Module):
-    """Classic 4-level U-Net encoder, returns skip features and bottleneck.
+def _normalize_encoder_name(name: str) -> str:
+    """SMP uses hyphens for timm names. Accept underscore alias(es) and normalize."""
+    return name.replace("_", "-")
 
-    Channels: C1, C2, C3, C4, C5 = base, 2*base, 4*base, 8*base, 16*base.
-    Returns (skips, bottleneck) where skips = [e1, e2, e3, e4].
+
+class _TimeFusion(nn.Module):
+    """Fuse features from t0 and t1 at a given scale.
+
+    mode ∈ {"concat", "diff", "absdiff", "concat_diff"}
+    Output channels == in_ch (keeps decoder channel math intact).
     """
-    def __init__(self, in_ch: int, base_ch: int = 64):
+    def __init__(self, in_ch: int, mode: str = "absdiff"):
         super().__init__()
-        C1, C2, C3, C4, C5 = base_ch, base_ch*2, base_ch*4, base_ch*8, base_ch*16
-        self.inc = DoubleConv(in_ch, C1)
-        self.down1 = Down(C1, C2)
-        self.down2 = Down(C2, C3)
-        self.down3 = Down(C3, C4)
-        self.down4 = Down(C4, C5)
-        self.channels = (C1, C2, C3, C4, C5)
-
-    def forward(self, x: torch.Tensor):
-        e1 = self.inc(x)      # (B, C1, H,   W)
-        e2 = self.down1(e1)   # (B, C2, H/2, W/2)
-        e3 = self.down2(e2)   # (B, C3, H/4, W/4)
-        e4 = self.down3(e3)   # (B, C4, H/8, W/8)
-        b  = self.down4(e4)   # (B, C5, H/16,W/16)
-        return [e1, e2, e3, e4], b
-
-
-class UNetDecoder(nn.Module):
-    """Standard 4-stage decoder that consumes fused skips and fused bottleneck.
-
-    Assumes skip channel sizes follow the encoder base scheme (C1..C4) and bottleneck C5.
-    """
-    def __init__(self, base_ch: int = 64, out_ch: int = 1, bilinear: bool = True):
-        super().__init__()
-        C1, C2, C3, C4, C5 = base_ch, base_ch*2, base_ch*4, base_ch*8, base_ch*16
-        self.up1 = Up(C5 + C4, C4, bilinear)
-        self.up2 = Up(C4 + C3, C3, bilinear)
-        self.up3 = Up(C3 + C2, C2, bilinear)
-        self.up4 = Up(C2 + C1, C1, bilinear)
-        self.outc = OutConv(C1, out_ch)
-
-    def forward(self, b: torch.Tensor, f_skips) -> torch.Tensor:
-        f1, f2, f3, f4 = f_skips  # C1..C4
-        x = self.up1(b, f4)
-        x = self.up2(x, f3)
-        x = self.up3(x, f2)
-        x = self.up4(x, f1)
-        return self.outc(x)
-
-
-# ------------------------
-# Fusion blocks
-# ------------------------
-
-class TimeFusion(nn.Module):
-    """Fuse features from two times t0, t1 for a given scale.
-
-    fusion_mode ∈ {"concat", "diff", "absdiff", "concat_diff"}
-      - "concat": cat along C then reduce via 1x1 conv to original C
-      - "diff":   (t1 - t0) then 3x3 conv
-      - "absdiff":|t1 - t0| then 3x3 conv
-      - "concat_diff": [t0, t1, |t1-t0|] then 1x1 reduce
-    Output channels == in_ch (so decoder channel math stays simple).
-    """
-    def __init__(self, in_ch: int, fusion_mode: str = "absdiff"):
-        super().__init__()
-        self.mode = fusion_mode
-        if fusion_mode == "concat":
+        self.mode = mode
+        if mode == "concat":
             self.proj = nn.Conv2d(in_ch * 2, in_ch, kernel_size=1, bias=False)
-        elif fusion_mode == "concat_diff":
+        elif mode == "concat_diff":
             self.proj = nn.Conv2d(in_ch * 3, in_ch, kernel_size=1, bias=False)
-        elif fusion_mode in {"diff", "absdiff"}:
+        elif mode in {"diff", "absdiff"}:
             self.proj = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, bias=False)
         else:
-            raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
+            raise ValueError(f"Unsupported fusion mode: {mode}")
         self.bn = nn.BatchNorm2d(in_ch)
         self.act = nn.ReLU(inplace=True)
 
@@ -162,21 +73,19 @@ class TimeFusion(nn.Module):
             x = f1 - f0
         elif self.mode == "absdiff":
             x = torch.abs(f1 - f0)
-        elif self.mode == "concat_diff":
+        else:  # concat_diff
             x = torch.cat([f0, f1, torch.abs(f1 - f0)], dim=1)
-        else:
-            raise RuntimeError
         x = self.proj(x)
         return self.act(self.bn(x))
 
 
-class ModalFusion(nn.Module):
-    """Fuse two modality features (e.g., Optical and SAR) at the same scale.
+class _ModalFusion(nn.Module):
+    """Fuse two modality features (e.g., optical & SAR) at same scale.
 
     mode ∈ {"concat", "se"}
       - concat: [opt, sar] → 1x1 → C
-      - se:     squeeze-and-excitation style gating per modality then sum (channels remain C)
-    Assumes both inputs have the same channel count C.
+      - se: squeeze-excitation gates per modality, then weighted sum
+    Assumes both inputs have C channels.
     """
     def __init__(self, in_ch: int, mode: str = "concat"):
         super().__init__()
@@ -191,7 +100,7 @@ class ModalFusion(nn.Module):
                 nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(in_ch * 2, r, 1),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(r, 2, 1),  # logits per modality
+                nn.Conv2d(r, 2, 1),
                 nn.Sigmoid(),
             )
         else:
@@ -201,63 +110,216 @@ class ModalFusion(nn.Module):
         if self.mode == "concat":
             x = self.proj(torch.cat([f_opt, f_sar], dim=1))
             return self.act(self.bn(x))
-        else:  # SE gating
-            x = torch.cat([f_opt, f_sar], dim=1)
-            w = self.se(x)  # (B, 2, 1, 1)
-            w_opt = w[:, 0:1]
-            w_sar = w[:, 1:2]
-            return w_opt * f_opt + w_sar * f_sar
+        w = self.se(torch.cat([f_opt, f_sar], dim=1))
+        return w[:, :1] * f_opt + w[:, 1:] * f_sar
 
 
-# ------------------------
-# 1) Siamese U-Net (shared weights)
-# ------------------------
+# --------------------------------------------------
+# 1) Siamese U-Net (shared weights) — single modality
+# --------------------------------------------------
 
-class SiameseUNetShared(nn.Module):
-    """Siamese U-Net with a single encoder shared across times and per-scale fusion.
+class SiameseUNetSMPShared(nn.Module):
+    """Siamese UNet using an SMP pretrained encoder + SMP Unet decoder.
 
     Args:
-        in_ch: input channels (e.g., 4 for S2 RGB+NIR)
-        base_ch: U-Net base channels
-        fusion_mode: how to fuse t0 vs t1 features per scale (see TimeFusion)
-        out_ch: number of output channels (1 for binary change)
-        bilinear: use bilinear upsampling in decoder
+        in_channels: input channels (e.g., 4 for S2 RGB+NIR)
+        classes: output channels (1 for binary change)
+        encoder_name: e.g. "timm_efficientnet_b1" or "timm-efficientnet-b1"
+        encoder_weights: usually "imagenet" (works with non-3ch via weight remapping)
+        encoder_depth: number of downsampling blocks to use (3..5)
+        decoder_channels: channel plan of Unet decoder blocks (len == encoder_depth)
+        time_fusion_mode: per-scale fusion of t0/t1 features
     """
-    def __init__(self, in_ch: int, base_ch: int = 64, fusion_mode: str = "absdiff", out_ch: int = 1, bilinear: bool = True):
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int = 1,
+        encoder_name: str = "timm_efficientnet_b1",
+        encoder_weights: Optional[str] = "imagenet",
+        encoder_depth: int = 5,
+        decoder_channels: Sequence[int] = (256, 128, 64, 32, 16),
+        time_fusion_mode: str = "absdiff",
+        decoder_interpolation: str = "nearest",  # SMP ≥0.5
+    ):
         super().__init__()
-        self.encoder = UNetEncoder(in_ch, base_ch)
-        C1, C2, C3, C4, C5 = self.encoder.channels
-        # Per-scale time fusion blocks (skips + bottleneck)
-        self.tf1 = TimeFusion(C1, fusion_mode)
-        self.tf2 = TimeFusion(C2, fusion_mode)
-        self.tf3 = TimeFusion(C3, fusion_mode)
-        self.tf4 = TimeFusion(C4, fusion_mode)
-        self.tfb = TimeFusion(C5, fusion_mode)
-        # Decoder consumes fused features of original dims
-        self.decoder = UNetDecoder(base_ch=base_ch, out_ch=out_ch, bilinear=bilinear)
+        enc_name = _normalize_encoder_name(encoder_name)
+
+        # Shared encoder across time
+        self.encoder = smp.encoders.get_encoder(
+            enc_name, in_channels=in_channels, depth=encoder_depth, weights=encoder_weights
+        )
+        self._enc_channels = list(self.encoder.out_channels)  # [in, c1, c2, c3, c4, c5]
+
+        # Per-stage time fusion blocks (same channel dims as encoder features)
+        self.time_fuse = nn.ModuleList([_TimeFusion(c, time_fusion_mode) for c in self._enc_channels])
+
+        # UNet decoder built directly from SMP
+        self.decoder = UnetDecoder(
+            encoder_channels=self._enc_channels,
+            decoder_channels=decoder_channels,
+            n_blocks=encoder_depth,
+            use_norm="batchnorm",
+            add_center_block=enc_name.startswith("vgg"),
+            attention_type=None,
+            interpolation_mode=decoder_interpolation,
+        )
+
+        self.seg_head = SegmentationHead(
+            in_channels=decoder_channels[-1], out_channels=classes, activation=None, kernel_size=3
+        )
 
     def forward(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-        # Encode both times with shared weights
-        s0, b0 = self.encoder(x0)
-        s1, b1 = self.encoder(x1)
-        # Fuse per scale
-        f1 = self.tf1(s0[0], s1[0])
-        f2 = self.tf2(s0[1], s1[1])
-        f3 = self.tf3(s0[2], s1[2])
-        f4 = self.tf4(s0[3], s1[3])
-        fb = self.tfb(b0, b1)
-        # Decode
-        logits = self.decoder(fb, [f1, f2, f3, f4])
-        return logits
+        # Encoder features at each stage
+        f0: List[torch.Tensor] = self.encoder(x0)  # len = encoder_depth+1
+        f1: List[torch.Tensor] = self.encoder(x1)
+
+        # Per-stage time fusion (keeps original channel dims)
+        fused: List[torch.Tensor] = [self.time_fuse[i](f0[i], f1[i]) for i in range(len(f0))]
+
+        # SMP UnetDecoder expects *features (varargs)
+        dec = self.decoder(fused)
+        return self.seg_head(dec)
+
+
+# -----------------------------------------------------------------
+# 2) Dual-stream Siamese U-Net (SAR + Optical) — shared per modality
+# -----------------------------------------------------------------
+
+class SiameseUNetSMPDualStream(nn.Module):
+    """Dual-stream (Optical+SAR) Siamese UNet on top of SMP pretrained encoders.
+
+    Pipeline:
+      - Optical encoder shared over time, SAR encoder shared over time.
+      - Time fusion within each modality per scale.
+      - Cross-modal fusion per scale → single fused pyramid.
+      - SMP Unet decoder on the fused pyramid.
+
+    Inputs:
+      x0_opt, x1_opt: optical t0/t1 (B, C_opt, H, W)
+      x0_sar, x1_sar: sar     t0/t1 (B, C_sar, H, W)
+    """
+    def __init__(
+        self,
+        optical_in_channels: int,
+        sar_in_channels: int,
+        classes: int = 1,
+        encoder_name: str = "timm_efficientnet_b1",
+        encoder_weights: Optional[str] = "noisy-student",
+        encoder_depth: int = 5,
+        decoder_channels: Sequence[int] = (256, 128, 64, 32, 16),
+        time_fusion_mode: str = "absdiff",
+        modal_fusion_mode: str = "concat",  # or "se"
+        decoder_interpolation: str = "nearest",
+    ):
+        super().__init__()
+        enc_name = _normalize_encoder_name(encoder_name)
+
+        # Encoders per modality (weights shared over time within each modality)
+        self.enc_opt = smp.encoders.get_encoder(
+            enc_name, in_channels=optical_in_channels, depth=encoder_depth, weights=encoder_weights
+        )
+        self.enc_sar = smp.encoders.get_encoder(
+            enc_name, in_channels=sar_in_channels, depth=encoder_depth, weights=encoder_weights
+        )
+        self._enc_channels = list(self.enc_opt.out_channels)  # same layout for both
+
+        # Time fusion inside each modality
+        self.tf_opt = nn.ModuleList([_TimeFusion(c, time_fusion_mode) for c in self._enc_channels])
+        self.tf_sar = nn.ModuleList([_TimeFusion(c, time_fusion_mode) for c in self._enc_channels])
+
+        # Cross-modal fusion per scale
+        self.mf = nn.ModuleList([_ModalFusion(c, modal_fusion_mode) for c in self._enc_channels])
+
+        # Decoder & head
+        try:
+            self.decoder = UnetDecoder(
+                encoder_channels=self._enc_channels,
+                decoder_channels=decoder_channels,
+                n_blocks=encoder_depth,
+                use_norm="batchnorm",
+                add_center_block=enc_name.startswith("vgg"),
+                attention_type=None,
+                interpolation_mode=decoder_interpolation,
+            )
+        except TypeError:
+            self.decoder = UnetDecoder(
+                encoder_channels=self._enc_channels,
+                decoder_channels=list(decoder_channels),
+                n_blocks=encoder_depth,
+                use_batchnorm=True,
+                center=enc_name.startswith("vgg"),
+                attention_type=None,
+            )
+        self.seg_head = SegmentationHead(
+            in_channels=decoder_channels[-1], out_channels=classes, activation=None, kernel_size=3
+        )
+
+    def forward(
+        self,
+        x0_opt: torch.Tensor,
+        x1_opt: torch.Tensor,
+        x0_sar: torch.Tensor,
+        x1_sar: torch.Tensor,
+    ) -> torch.Tensor:
+        # Encode per modality & time
+        f0o: List[torch.Tensor] = self.enc_opt(x0_opt)
+        f1o: List[torch.Tensor] = self.enc_opt(x1_opt)
+        f0s: List[torch.Tensor] = self.enc_sar(x0_sar)
+        f1s: List[torch.Tensor] = self.enc_sar(x1_sar)
+
+        # Time fusion inside each modality
+        fo: List[torch.Tensor] = [self.tf_opt[i](f0o[i], f1o[i]) for i in range(len(f0o))]
+        fs: List[torch.Tensor] = [self.tf_sar[i](f0s[i], f1s[i]) for i in range(len(f0s))]
+
+        # Cross-modal fusion per scale (keeps encoder channel dims)
+        fused: List[torch.Tensor] = [self.mf[i](fo[i], fs[i]) for i in range(len(fo))]
+
+        dec = self.decoder(*fused)
+        return self.seg_head(dec)
+
 
 # ------------------------
-# Simple sanity tests
+# Sanity checks
 # ------------------------
 
-# def _sanity_single():
-#     B, H, W = 2, 256, 256
-#     x0 = torch.randn(B, 4, H, W)  # e.g., S2 RGB+NIR
-#     x1 = torch.randn(B, 4, H, W)
-#     model = SiameseUNetShared(in_ch=4, base_ch=32, fusion_mode="concat_diff", out_ch=1)
-#     y = model(x0, x1)
-#     print("SiameseUNetShared", y.shape)
+def _sanity_single():
+    B, H, W = 2, 256, 256
+    x0 = torch.randn(B, 4, H, W)
+    x1 = torch.randn(B, 4, H, W)
+    model = SiameseUNetSMPShared(
+        in_channels=4,
+        classes=1,
+        encoder_name="timm_efficientnet_b1",  # underscore or hyphen accepted
+        encoder_weights="imagenet",
+        encoder_depth=5,
+        decoder_channels=(256, 128, 64, 32, 16),
+        time_fusion_mode="concat_diff",
+    )
+    with torch.inference_mode():
+        y = model(x0, x1)
+    print("SiameseUNetSMPShared:", y.shape)
+
+
+def _sanity_dual():
+    B, H, W = 2, 256, 256
+    x0_opt = torch.randn(B, 4, H, W)
+    x1_opt = torch.randn(B, 4, H, W)
+    x0_sar = torch.randn(B, 2, H, W)
+    x1_sar = torch.randn(B, 2, H, W)
+    model = SiameseUNetSMPDualStream(
+        optical_in_channels=4,
+        sar_in_channels=2,
+        classes=1,
+        encoder_name="timm-efficientnet-b1",
+        encoder_weights="imagenet",
+        time_fusion_mode="absdiff",
+        modal_fusion_mode="se",
+    )
+    with torch.inference_mode():
+        y = model(x0_opt, x1_opt, x0_sar, x1_sar)
+    print("SiameseUNetSMPDualStream:", y.shape)
+
+
+if __name__ == "__main__":
+    _sanity_single()
+    _sanity_dual()
