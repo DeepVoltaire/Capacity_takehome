@@ -2,7 +2,7 @@
 
 - Task description: [Link](https://storage.googleapis.com/capacity_shared/Technical%20Take-Home%20Exercise%20Multi-Sensor%20Deforestation%20Detection.pdf)
 
-- Slides with visuals and commentary: [Link](https://docs.google.com/presentation/d/1tItbbZQ-TN-Qxc1ZezJLTdLC7mL_EHSxQKBgPThgXWc/edit?usp=sharing)
+## Slides with visuals and commentary: [Link](https://docs.google.com/presentation/d/1tItbbZQ-TN-Qxc1ZezJLTdLC7mL_EHSxQKBgPThgXWc/edit?usp=sharing)
 
 ## Notebooks and what they do
 - [Exploration.ipynb](Exploration.ipynb): Visualize all available data for all events + show deforestation mask.
