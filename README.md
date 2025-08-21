@@ -9,7 +9,8 @@
 - [Data_Setup_and_Train.ipynb](Data_Setup_and_Train.ipynb): Create datasets + Train S2/S1 single sensor Siamese/Concat Unets + S1+S2 multisensor Concat Unet.
 
 ## Example Setup
-`conda create -n myenv python=3.11 pip -y && conda run -n myenv python -m pip install -r requirements.txt`
+- `conda create -n myenv python=3.11 pip -y && conda run -n myenv python -m pip install -r requirements.txt`
+- run `./download_dataset.sh all --extract ` and move the data into data/
 
 
 ## Example S2 Prediction vs. Ground Truth
