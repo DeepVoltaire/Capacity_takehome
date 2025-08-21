@@ -1,0 +1,30 @@
+alpha: 0.5
+backbone: timm_efficientnet_b1
+da_brightness_magnitude: 0.0
+da_contrast_magnitude: 0.0
+df_path: catalogues/2025_08_20_s1.pkl
+epoch_start_scheduler: 6
+fold_nb: 3
+gpu_da_params:
+- 0.25
+input_channel: 2
+lr: 0.001
+model: unetplusplus
+n_epochs: 1000
+name: Exp_S1_1-0
+num_batches: 9
+num_classes: 1
+only_val: false
+patience: 5
+pretrained: noisy-student
+print_freq: 500
+random_sized_params:
+- 0.0
+- 0.0
+randomsizecrop_interpolation: 1
+resume: ''
+train_batch_size: 16
+train_crop_size: 288
+use_fp16: 0
+val_batch_size: 32
+weight_decay: 0.0

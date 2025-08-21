@@ -40,34 +40,7 @@ def scale_img(matrix, min_values, max_values):
     out = np.reshape(flat, (w, h, d))
     return out.clip(0, 1)
 
-# def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
-#     # img = tifffile.imread(concat_bands_path)
-#     img = rasterio.open(concat_bands_path).read()
-#     if img.shape[0] < 25:
-#         img = np.transpose(img, (1, 2, 0))
-
-
-#     if "L2A" in concat_bands_path:
-#         fcc_to_band_indices = fcc_to_band_indices_l2a
-#     else:
-#         fcc_to_band_indices = fcc_to_band_indices_16d
-#     img = img[:, :, fcc_to_band_indices[profile]]
-#     img = img.astype(np.float32)
-#     # img = img - 1000
-#     # img[img < 0] = 0
-
-#     _img = img.copy()  # make a copy where we fill nodata with nan for percentile computation
-#     _img[_img == 0] = np.nan
-#     mins = np.nanpercentile(_img, 2, axis=(0,1))
-#     maxs = np.nanpercentile(_img, 98, axis=(0,1))
-#     print(f"S2: {mins=}, {maxs=}")
-#     maxs = maxs.clip(3000, None)
-#     print(f"S2 clipped: {mins=}, {maxs=}")
-
-#     return scale_img(img, mins, maxs)
-
 def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
-    # img = tifffile.imread(concat_bands_path)
     img = rasterio.open(concat_bands_path).read()
     if img.shape[0] < 25:
         img = np.transpose(img, (1, 2, 0))
@@ -99,42 +72,8 @@ def visualize_s2_concat_bands_path(concat_bands_path, profile = "SWIR"):
         img = img - 1000
         img[img < 0] = np.nan
 
-    # min_ = img.min(axis=(0,1)).round(0)
-    # max_ = img.max(axis=(0,1)).round(0)
-    # mean_ = img.mean(axis=(0,1)).round(0)
-    # print(f"{min_}, {max_}, {mean_} (factor {factor})")
     return scale_img(img, np.array(min_max_l2a[profile]["min"]), np.array(min_max_l2a[profile]["max"]))
 
-
-# def visualize_s2_concat_bands_path_old(concat_bands_path, profile = "SWIR"):
-#     # img = tifffile.imread(concat_bands_path)
-#     img = rasterio.open(concat_bands_path).read()
-#     if img.shape[0] < 25:
-#         img = np.transpose(img, (1, 2, 0))
-#     if "L2A" in concat_bands_path:
-#         fcc_to_band_indices = fcc_to_band_indices_l2a
-#         min_max = min_max_l2a
-#         # img = img.astype(np.float32)
-#         # img = img - 1000
-#         # img[img < 0] = 0
-#         # img[img == 0] = np.nan
-
-#         mins = np.array(min_max[profile]["min"])
-#         maxs = np.array(min_max[profile]["max"])
-#         # print(np.nanmean(img[:, :, fcc_to_band_indices[profile]]))
-#         # if np.nanmean(img[:, :, fcc_to_band_indices[profile]]) > 2500:
-#         #     maxs = maxs + 1000
-#         return scale_img(img[:, :, fcc_to_band_indices[profile]], mins, maxs)
-#     else:
-#         fcc_to_band_indices = fcc_to_band_indices_16d
-#         min_max = min_max_16d
-#         _img = img[:, :, fcc_to_band_indices[profile]].copy()
-#         _img = _img.astype(np.float32)
-#         _img[_img == 0] = np.nan
-#         mins = np.nanpercentile(_img, 2, axis=(0,1))
-#         maxs = np.nanpercentile(_img, 98, axis=(0,1))
-#         print(f"16D: {mins=}, {maxs=}")
-#         return scale_img(img[:, :, fcc_to_band_indices[profile]], np.array(min_max[profile]["min"]), np.array(min_max[profile]["max"]))
 
 def visualize_ls_concat_bands_path(concat_bands_path, profile = "SWIR", downsample = 0):
     img = rasterio.open(concat_bands_path).read().astype(np.float32)

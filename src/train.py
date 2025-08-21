@@ -9,7 +9,7 @@ import pytz
 import torch
 import yaml
 import torch.nn as nn
-from src.model import SiameseUNetSMPShared
+from src.model import build_model
 
 torch.backends.cudnn.benchmark = True
 import datetime
@@ -52,20 +52,9 @@ def train(hps, train_loader, val_loader):
     log.setLevel(logging.INFO)
 
     # Initialize model, loss, optimizer and lr schedule
-    model = SiameseUNetSMPShared(
-        in_channels=hps.input_channel,
-        classes=hps.num_classes + 1,
-        encoder_name=hps.backbone, #"timm_efficientnet_b1",  # underscore or hyphen accepted
-        encoder_weights=hps.pretrained, #"noisy-student", #"imagenet",
-        encoder_depth=5,
-        decoder_channels=(256, 128, 64, 32, 16),
-        time_fusion_mode="concat_diff",
-        # time_fusion_mode="diff",
-    )
-
+    model = build_model(hps)
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
-    logging.info(f"Training with {torch.cuda.device_count()} GPUS")
 
     loss_func = XEDiceLoss(alpha=hps.alpha, num_classes=hps.num_classes, ignore_index=255)
 
@@ -82,9 +71,7 @@ def train(hps, train_loader, val_loader):
     )
     model.to(device="cuda")
 
-    if hps.use_fp16:
-        scaler = torch.amp.GradScaler()
-        logging.info(f"Training is done with mixed precision")
+    logging.info(f"Training with {torch.cuda.device_count()} GPUS")
 
     if len(hps.resume) > 0:
         checkpoint = torch.load(hps.resume, map_location="cpu")
@@ -120,22 +107,13 @@ def train(hps, train_loader, val_loader):
             gpu_da_time.update(time.time() - start)
 
             optimizer.zero_grad()
-            if hps.use_fp16:
-                with torch.amp.autocast(device_type="cuda"):
-                    preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
-                    loss = loss_func(preds, targets)
-
-                # Scales loss. Calls backward() on scaled loss to create scaled gradients.
-                scaler.scale(loss).backward()
-                # Unscales the gradients, then optimizer.step() is called if gradients are not inf/nan,
-                scaler.step(optimizer)
-                # Updates the scale for next iteration.
-                scaler.update()
-            else:
+            if hps.model == "siamese_unet":
                 preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
-                loss = loss_func(preds, targets)
-                loss.backward()
-                optimizer.step()
+            else:
+                preds = model(x_data)
+            loss = loss_func(preds, targets)
+            loss.backward()
+            optimizer.step()
 
             losses.update(loss.detach().item(), x_data.size(0))
 
@@ -169,13 +147,11 @@ def train(hps, train_loader, val_loader):
             x_data = data["image"].to(device="cuda", non_blocking=True)
             targets = data["mask"].long().to(device="cuda", non_blocking=True)
 
-            if hps.use_fp16:
-                with torch.amp.autocast(device_type="cuda"):
-                    preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
-                    loss = loss_func(preds, targets)
-            else:
+            if hps.model == "siamese_unet":
                 preds = model(x_data[:, :hps.input_channel], x_data[:, hps.input_channel:])
-                loss = loss_func(preds, targets)
+            else:
+                preds = model(x_data)
+            loss = loss_func(preds, targets)
             losses.update(loss.detach().item(), x_data.size(0))
 
             preds = (torch.softmax(preds, dim=1)[:, 1:] > 0.5) * 1

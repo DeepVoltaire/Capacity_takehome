@@ -1,0 +1,32 @@
+alpha: 0.5
+backbone: timm_efficientnet_b1
+da_brightness_magnitude: 0.0
+da_contrast_magnitude: 0.0
+df_path: catalogues/2025_08_21_s2_s1.pkl
+epoch_start_scheduler: 10
+fold_nb: 1
+gpu_da_params:
+- 0.25
+input_channel: 30
+lr: 0.001
+model: concat_unetplusplus
+n_epochs: 1000
+name: Exp_S2_S1_1-0
+num_batches: 15
+num_classes: 1
+only_val: false
+patience: 8
+pretrained: noisy-student
+print_freq: 500
+random_sized_params:
+- 0.0
+- 0.0
+randomsizecrop_interpolation: 1
+resume: ''
+smp_decoder_channels_mult: 1.0
+smp_decoder_use_attention: false
+smp_decoder_use_batchnorm: true
+train_batch_size: 16
+train_crop_size: 320
+val_batch_size: 32
+weight_decay: 0.0

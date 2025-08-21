@@ -40,14 +40,17 @@ class HyperParams(object):
     ## Model
     num_classes = attr.ib(default=1, type=int)
     input_channel = attr.ib(default=2, type=int)
+    smp_decoder_use_batchnorm = attr.ib(default=True, type=bool)
+    smp_decoder_channels_mult = attr.ib(default=1.0, type=float, converter=float)
+    smp_decoder_use_attention = attr.ib(default=False, type=bool)
     backbone = attr.ib(default="timm_efficientnet_b1", type=str)
-    model = attr.ib(default="unet", validator=in_(["unet", "unetplusplus"]))
+    model = attr.ib(default="siamese_unet") # ["siamese_unet", "concat_unet", "concat_unetplusplus"]
     pretrained = attr.ib(default="noisy-student", type=str)
 
     ## Training Setup
     resume = attr.ib(default="", type=str)
+    use_fp16 = attr.ib(default=False, type=bool)
     n_epochs = attr.ib(default=1000, type=int)
-    use_fp16 = attr.ib(default=True, type=bool)
     patience = attr.ib(default=4, type=int)
     epoch_start_scheduler = attr.ib(default=7, type=int)
     num_batches = attr.ib(default=0, type=int)

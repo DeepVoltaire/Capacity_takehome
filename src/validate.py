@@ -7,35 +7,10 @@ import tifffile
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.model import SiameseUNetSMPShared
+from src.model import build_model
 from src.train import tp_fp_fn_with_ignore
 from src.data import get_dataloaders
-from src.visualize import visualize_s2_concat_bands_path, visualize_s1_path, visualize_s2_concat_bands_path_new
-
-
-def predict_and_save(models, val_loader):
-    """
-    Predicts given a val_loader and a list of loaded models and hps
-    """
-    probs = []
-    torch.set_grad_enabled(False)
-    for iter_num, data in tqdm(enumerate(val_loader), total=len(val_loader)):
-        x_data = data["image"].cuda(non_blocking=True)
-        with torch.amp.autocast(device_type="cuda"):
-            preds = torch.softmax(models[0](x_data), dim=1)[:, 1:]
-            for model_nb in range(1, len(models)):
-                preds += torch.softmax(models[model_nb](x_data), dim=1)[:, 1:]
-
-        preds /= len(models)
-        if preds.size(1) == 1:
-            preds = preds[:, 0]
-        probs.append(preds.cpu().numpy())
-    # Concatenate predictions with potentially unequal batch size for the last batch
-    probs_last = probs[-1]
-    probs = np.array(probs[:-1])
-    probs = probs.reshape((-1,))
-    probs = np.concatenate((probs, probs_last), axis=0)
-    return probs
+from src.visualize import visualize_s2_concat_bands_path, visualize_s1_path
 
 
 def find_and_load_models(hps_list, fold_list=[0, 1, 2]):
@@ -43,16 +18,7 @@ def find_and_load_models(hps_list, fold_list=[0, 1, 2]):
     models = []
     for fold_nb in fold_list:
         for hps in hps_list:
-            model = SiameseUNetSMPShared(
-                in_channels=hps.input_channel,
-                classes=hps.num_classes + 1,
-                encoder_name=hps.backbone,
-                encoder_weights=hps.pretrained,
-                encoder_depth=5,
-                decoder_channels=(256, 128, 64, 32, 16),
-                time_fusion_mode="concat_diff",
-            )
-
+            model = build_model(hps)
             model = model.cuda()
             model.eval()
 
@@ -105,9 +71,15 @@ def return_metrics_all_folds(
 
             # predict
             with torch.amp.autocast(device_type="cuda"):
-                preds = torch.softmax(models[0](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
+                if hps.model == "siamese_unet":
+                    preds = torch.softmax(models[0](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
+                else:
+                    preds = torch.softmax(models[0](x_data), dim=1)[:, 1]
                 for model_nb in range(1, len(models)):
-                    preds += torch.softmax(models[model_nb](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
+                    if hps.model == "siamese_unet":
+                        preds += torch.softmax(models[model_nb](x_data[:, :hps.input_channel], x_data[:, hps.input_channel:]), dim=1)[:, 1]
+                    else:
+                        preds += torch.softmax(models[model_nb](x_data), dim=1)[:, 1]
             preds /= len(models)
 
             if also_save_preds:  # save preds as uint8
@@ -133,7 +105,7 @@ def visualize_single_model(
     tps,
     fps,
     fns,
-    preds_list,
+    preds,
     threshold,
     img_paths_before,
     img_paths_after,
@@ -169,13 +141,12 @@ def visualize_single_model(
         count += 1
         if count <= skip_how_many:
             continue
-        pred = np.array([preds[i] for preds in preds_list])
-        pred = (pred.mean(axis=0) > threshold) * 1
+        pred = (preds[i] > threshold) * 1
 
         fold, clouds_nodata_best_before, clouds_nodata_best_after = df.loc[df["path_best_before"] == img_paths_before[i], [
             "fold", "clouds_nodata_best_before", "clouds_nodata_best_after"]].iloc[0]
 
-        print(f"{img_paths_before[i]}, Fold {fold}")
+        print(f"{img_paths_before[i]}, Fold {int(fold)}")
         print(f"{img_paths_after[i]}")
         print(f"{GT_paths[i]}")
         print(f"FN/FP ratio      : {fns[i]/(fps[i]+1):.1f}")
@@ -186,8 +157,8 @@ def visualize_single_model(
         print(f"{i}")
 
         if "_sentinel2_" in img_paths_before[i]:
-            img_before = visualize_s2_concat_bands_path_new(img_paths_before[i])
-            img_after = visualize_s2_concat_bands_path_new(img_paths_after[i])
+            img_before = visualize_s2_concat_bands_path(img_paths_before[i])
+            img_after = visualize_s2_concat_bands_path(img_paths_after[i])
         else:
             img_before = visualize_s1_path(img_paths_before[i])
             img_after = visualize_s1_path(img_paths_after[i])
@@ -219,19 +190,150 @@ def visualize_single_model(
         ax[3].imshow(img_after)
         ax[3].imshow(np.ma.masked_where(label != 1, label), cmap="autumn", alpha=alpha)
         ax[3].set_title(f"Deforestation mask {deforest_date}", fontsize=fontsize)
+        plt.tight_layout()
+        plt.show()
 
-        # before_date = img_paths_before[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
-        # before_date_str = f"{before_date[:4]}-{before_date[4:6]}-{before_date[6:8]}"
-        # ax[1,0].set_title(f"Before: {before_date_str}", fontsize=fontsize)
-        # ax[1,0].imshow(img_before)
-        # ax[1,1].imshow(img_after)
-        # ax[1,1].set_title(f"After: {after_date_str}", fontsize=fontsize)
+        if count >= export_how_many + skip_how_many:
+            break
 
-        # fps_ = ((pred == 1) & (label == 0)) * 1
-        # fns_ = ((pred == 0) & (label == 1)) * 1
-        # ax[1,2].imshow(np.ma.masked_where(fps_ != 1, fps_), cmap="autumn", alpha=1)
-        # ax[1,2].imshow(np.ma.masked_where(fns_ != 1, fns_), cmap="gray", alpha=1)
-        # ax[1,2].set_title(f"FPs = RED ({fps_.sum()}), FNs = BLACK ({fns_.sum()})", fontsize=fontsize)
+
+def visualize_S2_S1_model(
+    df,
+    tps,
+    fps,
+    fns,
+    preds,
+    threshold,
+    img_paths_before_s1,
+    img_paths_after_s1,
+    img_paths_before_s2,
+    img_paths_after_s2,
+    GT_paths,
+    export_how_many=15,
+    skip_how_many=0,
+    alpha=0.5,
+    selection_criteria="FP+FN",
+    fontsize=20,
+):
+    """
+    Visualizes the worst or random predictions on validation images given lists of tps, fps, fns
+    """
+    if selection_criteria == "FP+FN":
+        idxs_to_use = np.argsort([fp + fn for fp, fn in zip(fps, fns)])[::-1]
+    elif selection_criteria == "FN":
+        idxs_to_use = np.argsort(fns)[::-1]
+    elif selection_criteria == "FP":
+        idxs_to_use = np.argsort(fps)[::-1]
+    elif selection_criteria == "TP":
+        idxs_to_use = np.argsort(tps)[::-1]
+    elif selection_criteria == "FP+FN ratio":
+        idxs_to_use = np.argsort([fn / (fp + 1e-6) for fp, fn in zip(fps, fns)])[::-1]
+    elif selection_criteria == "(FP+FN)/TP ratio":
+        idxs_to_use = np.argsort([(fp + fn) / (tp + 1e-6) for fp, fn, tp in zip(fps, fns, tps)])[::-1]
+    else:
+        idxs_to_use = list(range(len(fns)))
+        np.random.shuffle(idxs_to_use)
+
+    tp_sum, fp_sum, fn_sum = sum(tps) + 1, sum(fps) + 1, sum(fns) + 1
+    count = 0
+    for idx_, i in enumerate(idxs_to_use):
+        count += 1
+        if count <= skip_how_many:
+            continue
+        pred = (preds[i] > threshold) * 1
+
+        fold, clouds_nodata_best_before, clouds_nodata_best_after = df.loc[
+            (df["s1_after_path"] == img_paths_after_s1[i]) & (df["s2_after_path"] == img_paths_after_s2[i]), [
+            "fold", "clouds_nodata_best_before", "clouds_nodata_best_after"]].iloc[0]
+
+        print(f"{img_paths_before_s1[i]}, Fold {int(fold)}")
+        print(f"{img_paths_after_s1[i]}")
+        print(f"{img_paths_before_s2[i]}")
+        print(f"{img_paths_after_s2[i]}")
+        print(f"{GT_paths[i]}")
+        print(f"FN/FP ratio      : {fns[i]/(fps[i]+1):.1f}")
+        print(f"FP/TP ratio      : {fps[i]/(tps[i]+1):.1f}")
+        print(f"FN/TP ratio      : {fns[i]/(tps[i]+1):.1f}")
+        print(f"FP+FN / TP ratio : {(fps[i] + fns[i])/(tps[i]+1):.1f}")
+        print("#" * 100)
+        print(f"{i}")
+
+        after_sensor = "S2"
+        if img_paths_before_s1[i] == "empty":
+            img_before_s1 = np.zeros((400, 400))
+        else:
+            img_before_s1 = visualize_s1_path(img_paths_before_s1[i])
+        if img_paths_after_s1[i] == "empty":
+            img_after_s1 = np.zeros((400, 400))
+        else:
+            after_sensor = "S1"
+            img_after_s1 = visualize_s1_path(img_paths_after_s1[i])
+
+        if img_paths_before_s2[i] == "empty":
+            img_before_s2 = np.zeros((400, 400))
+        else:
+            img_before_s2 = visualize_s2_concat_bands_path(img_paths_before_s2[i])
+        if img_paths_after_s2[i] == "empty":
+            img_after_s2 = np.zeros((400, 400))
+        else:
+            img_after_s2 = visualize_s2_concat_bands_path(img_paths_after_s2[i])
+
+        before_date_s1 = img_paths_before_s1[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        before_date_s1 = f"{before_date_s1[:4]}-{before_date_s1[4:6]}-{before_date_s1[6:8]}"
+        before_date_s2 = img_paths_before_s2[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        before_date_s2 = f"{before_date_s2[:4]}-{before_date_s2[4:6]}-{before_date_s2[6:8]}"
+        after_date_s1 = img_paths_after_s1[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        after_date_s1 = f"{after_date_s1[:4]}-{after_date_s1[4:6]}-{after_date_s1[6:8]}"
+        after_date_s2 = img_paths_after_s2[i].replace("_uncompressed", "").split("/")[-1].split('.')[0].split('_')[-1]
+        after_date_s2 = f"{after_date_s2[:4]}-{after_date_s2[4:6]}-{after_date_s2[6:8]}"
+
+        f, ax = plt.subplots(1, 4, figsize=(35, 10))
+        if after_sensor == "S1":
+            ax[0].imshow(img_before_s1)
+            ax[0].set_title(f"S1 Before: {before_date_s1}", fontsize=fontsize)
+            ax[1].imshow(img_after_s1)
+            ax[1].set_title(f"S1 After: {after_date_s1}", fontsize=fontsize)
+            ax[2].imshow(img_after_s1)
+            ax[3].imshow(img_after_s1)
+        else:
+            ax[0].imshow(img_before_s2)
+            ax[0].set_title(f"S2 Before: {before_date_s2}", fontsize=fontsize)
+            ax[1].imshow(img_after_s2)
+            ax[1].set_title(f"S2 After: {after_date_s2}", fontsize=fontsize)
+            ax[2].imshow(img_after_s2)
+            ax[3].imshow(img_after_s2)
+        
+        ax[2].imshow(np.ma.masked_where(pred == 0, pred), cmap="autumn", alpha=alpha)
+        title_string = f"FPs: {fps[i]:.0f} = {100 * fps[i] / fp_sum:.1f}%, FNs: {fns[i]:.0f} = {100 * fns[i] / fn_sum:.1f}%, TPs: {tps[i]:.0f}"
+        ax[2].set_title(f"(Pred) {title_string}", fontsize=fontsize)
+
+        if GT_paths[i] == "empty":
+            label = np.zeros((400, 400), dtype=np.uint8)
+            deforest_date = ""
+        else:
+            label = tifffile.imread(GT_paths[i])
+            deforest_date = GT_paths[i].split("/")[-1].split("_")[1]
+            deforest_date = f"{deforest_date[:4]}-{deforest_date[4:6]}-{deforest_date[6:8]}"
+        label = (label == 255).astype(np.uint8)
+        # ax[3].imshow(img_after)
+        ax[3].imshow(np.ma.masked_where(label != 1, label), cmap="autumn", alpha=alpha)
+        ax[3].set_title(f"Deforestation mask {deforest_date}", fontsize=fontsize)
+        plt.tight_layout()
+        plt.show()
+
+        # Show S1/S2 Before, S1/S2 After
+        f, ax = plt.subplots(1, 4, figsize=(35, 10))
+        ax[0].imshow(img_before_s1)
+        ax[0].set_title(f"S1 Before: {before_date_s1}", fontsize=fontsize)
+
+        ax[1].imshow(img_before_s2)
+        ax[1].set_title(f"S2 Before: {before_date_s2}", fontsize=fontsize)
+
+        ax[2].imshow(img_after_s1)
+        ax[2].set_title(f"S1 After: {after_date_s1}", fontsize=fontsize)
+
+        ax[3].imshow(img_after_s2)
+        ax[3].set_title(f"S2 After: {after_date_s2}", fontsize=fontsize)
         plt.tight_layout()
         plt.show()
 
