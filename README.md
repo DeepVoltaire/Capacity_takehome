@@ -7,6 +7,7 @@
 ## Notebooks and what they do
 - [Exploration.ipynb](Exploration.ipynb): Visualize all available data for all events + show deforestation mask.
 - [Data_Setup_and_Train.ipynb](Data_Setup_and_Train.ipynb): Create datasets + Train S2/S1 single sensor Siamese/Concat Unets + S1+S2 multisensor Concat Unet.
+- [Validate_Visualize.ipynb](Validate_Visualize.ipynb): Validate and visualize out-of-fold predictions for single sensor and multisensor models.
 
 ## Example Setup
 - `conda create -n myenv python=3.11 pip -y && conda run -n myenv python -m pip install -r requirements.txt`
